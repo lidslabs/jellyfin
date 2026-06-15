@@ -380,6 +380,12 @@ namespace MediaBrowser.Controller.MediaEncoding
                     return VideoStream?.VideoRangeType ?? VideoRangeType.Unknown;
                 }
 
+                // HDR passthrough preserves the source range type even though we transcode.
+                if (EncodingHelper.IsHdrPassthroughMode(this))
+                {
+                    return VideoStream?.VideoRangeType ?? VideoRangeType.Unknown;
+                }
+
                 if (Enum.TryParse(GetRequestedRangeTypes(ActualOutputVideoCodec).FirstOrDefault() ?? "Unknown", true, out VideoRangeType requestedRangeType))
                 {
                     return requestedRangeType;
@@ -388,6 +394,17 @@ namespace MediaBrowser.Controller.MediaEncoding
                 return VideoRangeType.Unknown;
             }
         }
+
+        /// <summary>
+        /// Gets a value indicating whether the encoder pipeline is in HDR passthrough mode.
+        /// </summary>
+        /// <remarks>
+        /// Convenience wrapper around <see cref="EncodingHelper.IsHdrPassthroughMode(EncodingJobInfo)"/>
+        /// so other components can query encoding state without taking a hard dependency
+        /// on EncodingHelper. Currently gated on the <c>JELLYFIN_ALLOW_HDR_TRANSCODE</c>
+        /// environment variable.
+        /// </remarks>
+        public bool IsHdrTranscoding => EncodingHelper.IsHdrPassthroughMode(this);
 
         public string TargetVideoCodecTag
         {
