@@ -1422,6 +1422,7 @@ public class DynamicHlsController : BaseJellyfinApiController
             .ConfigureAwait(false);
         var mediaSourceId = state.BaseRequest.MediaSourceId;
         double fps = state.TargetFramerate ?? 0.0f;
+
         int segmentLength = state.SegmentLength * 1000;
 
         // If video is transcoded and framerate is fractional (i.e. 23.976), we need to slightly adjust segment length
@@ -1639,6 +1640,15 @@ public class DynamicHlsController : BaseJellyfinApiController
             {
                 // fMP4 needs this flag to write the audio packet DTS/PTS including the initial delay into MOOF::TRAF::TFDT
                 hlsArguments += $" {(useLegacySegmentOption ? "-hls_ts_options" : "-hls_segment_options")} movflags=+frag_discont";
+
+                // NOTE: an earlier revision appended "+cmaf" here for HDR streams to
+                // force a CMAF-compliant colr atom. That broke fMP4 init segment
+                // generation with NVENC HEVC 10-bit (the client's request for
+                // hls1/main/-1.mp4 was canceled and ffmpeg restarted in a loop,
+                // producing ~1s playback then multi-second freezes). The standard
+                // fMP4 muxer already writes the colr atom from the encoder's
+                // -color_primaries / -color_trc / -colorspace args, so +cmaf was
+                // both redundant and harmful. Do not re-add it.
             }
 
             segmentFormat = "fmp4" + outputFmp4HeaderArg;
@@ -1662,15 +1672,27 @@ public class DynamicHlsController : BaseJellyfinApiController
                 Path.GetFileNameWithoutExtension(outputPath));
         }
 
+        // Timestamp handling. Jellyfin defaults to "-copyts -avoid_negative_ts disabled"
+        // for HLS seek accuracy. We use "make_zero" instead for HDR transcodes as a
+        // defense against negative-timestamp issues that surfaced when this build
+        // used fMP4 segments (fMP4 tfdt boxes are strictly unsigned; "disabled"
+        // could wrap negative and crash ExoPlayer). We're back on MPEG-TS now and
+        // TS has no tfdt box, so make_zero is largely defensive here - but it's
+        // also harmless and the safest value if delivery ever changes back.
+        var tsArgs = EncodingHelper.IsHdrPassthroughMode(state)
+            ? "-copyts -avoid_negative_ts make_zero"
+            : "-copyts -avoid_negative_ts disabled";
+
         return string.Format(
             CultureInfo.InvariantCulture,
-            "{0} {1} -map_metadata -1 -map_chapters -1 -threads {2} {3} {4} {5} -copyts -avoid_negative_ts disabled -max_muxing_queue_size {6} -f hls -max_delay 5000000 -hls_time {7} -hls_segment_type {8} -start_number {9}{10} -hls_segment_filename \"{11}\" {12} -y \"{13}\"",
+            "{0} {1} -map_metadata -1 -map_chapters -1 -threads {2} {3} {4} {5} {6} -max_muxing_queue_size {7} -f hls -max_delay 5000000 -hls_time {8} -hls_segment_type {9} -start_number {10}{11} -hls_segment_filename \"{12}\" {13} -y \"{14}\"",
             inputModifier,
             _encodingHelper.GetInputArgument(state, _encodingOptions, segmentContainer),
             threads,
             mapArgs,
             GetVideoArguments(state, startNumber, isEventPlaylist, segmentContainer),
             GetAudioArguments(state),
+            tsArgs,
             maxMuxingQueueSize,
             state.SegmentLength.ToString(CultureInfo.InvariantCulture),
             segmentFormat,
@@ -2069,6 +2091,22 @@ public class DynamicHlsController : BaseJellyfinApiController
         {
             return fileSystem.GetFiles(folder, new[] { segmentExtension }, true, false)
                 .Where(i => Path.GetFileNameWithoutExtension(i.Name).StartsWith(filePrefix, StringComparison.OrdinalIgnoreCase))
+                // Defensive filter: exclude any init segment named "<prefix>-1<ext>".
+                // Under MPEG-TS delivery (the current default) no init segment is
+                // produced, so this is a no-op. Kept for safety: if delivery is ever
+                // switched to fMP4, the init segment's "-1" suffix would parse to
+                // index -1 and poison GetCurrentTranscodingIndex - the negative
+                // index makes the throttle/gap logic think the transcode is
+                // perpetually behind, causing Jellyfin to kill/respawn ffmpeg in a
+                // loop (which trips NVDEC errors as a downstream effect).
+                // Media segments are always index >= 0; only the init segment would
+                // be negative, so this filter is both safe under TS and protective
+                // if fMP4 is ever re-enabled.
+                .Where(i =>
+                {
+                    var indexSpan = Path.GetFileNameWithoutExtension(i.Name.AsSpan()).Slice(filePrefix.Length);
+                    return int.TryParse(indexSpan, NumberStyles.Integer, CultureInfo.InvariantCulture, out var idx) && idx >= 0;
+                })
                 .MaxBy(fileSystem.GetLastWriteTimeUtc);
         }
         catch (IOException)

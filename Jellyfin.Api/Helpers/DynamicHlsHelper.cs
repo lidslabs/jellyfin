@@ -367,7 +367,18 @@ public class DynamicHlsHelper
         {
             var videoRange = state.VideoStream.VideoRange;
             var videoRangeType = state.VideoStream.VideoRangeType;
-            if (EncodingHelper.IsCopyCodec(state.OutputVideoCodec))
+
+            // Emit HDR signaling when:
+            //  (a) the stream is being copied (existing behavior), OR
+            //  (b) the transcode pipeline is in HDR passthrough mode, in which case
+            //      the output bytes are HDR even though OutputVideoCodec != "copy".
+            // Without case (b), the manifest declares VIDEO-RANGE=SDR while the
+            // bitstream carries BT.2020/PQ, which causes some players (ExoPlayer in
+            // particular) to mis-initialize the rendering pipeline.
+            var isHdrOutput = EncodingHelper.IsCopyCodec(state.OutputVideoCodec)
+                || EncodingHelper.IsHdrPassthroughMode(state);
+
+            if (isHdrOutput)
             {
                 if (videoRange == VideoRange.SDR)
                 {
@@ -390,7 +401,7 @@ public class DynamicHlsHelper
             }
             else
             {
-                // Currently we only encode to SDR.
+                // Encoding to SDR (the tonemap path)
                 builder.Append(",VIDEO-RANGE=SDR");
             }
         }
@@ -738,6 +749,16 @@ public class DynamicHlsHelper
             {
                 profileString ??= "main";
             }
+        }
+
+        // HDR passthrough: the bitstream is 10-bit HEVC Main10. The HLS CODECS attribute
+        // must reflect this (hvc1.2.4.* rather than hvc1.1.6.*). HlsCodecStringHelpers
+        // derives the profile_idc / compatibility / level fields from this string.
+        if (EncodingHelper.IsHdrPassthroughMode(state)
+            && (string.Equals(state.ActualOutputVideoCodec, "h265", StringComparison.OrdinalIgnoreCase)
+                || string.Equals(state.ActualOutputVideoCodec, "hevc", StringComparison.OrdinalIgnoreCase)))
+        {
+            profileString = "main10";
         }
 
         return profileString;
