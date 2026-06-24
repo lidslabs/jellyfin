@@ -156,7 +156,7 @@ public class MediaInfoController : BaseJellyfinApiController
             && profile is not null
             && LidslabsClientMatches(
                 profile.Name,
-                Environment.GetEnvironmentVariable("LIDSLABS_TRANSCODER_FORCE_HEVC_CLIENTS"))
+                Environment.GetEnvironmentVariable("LIDSLABS_FORCE_HEVC_CLIENTS"))
             && LidslabsProfileClaimsHevc(profile);
 
         // Copy params from posted body
@@ -289,7 +289,7 @@ public class MediaInfoController : BaseJellyfinApiController
         // features must agree on what "on" means or the override fragments silently.
         static bool LidslabsHdrTranscodeEnabled()
         {
-            var envFlag = Environment.GetEnvironmentVariable("JELLYFIN_ALLOW_HDR_TRANSCODE");
+            var envFlag = Environment.GetEnvironmentVariable("LIDSLABS_ALLOW_HDR_TRANSCODE");
             if (string.IsNullOrEmpty(envFlag))
             {
                 return false;

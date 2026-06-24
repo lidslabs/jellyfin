@@ -6383,7 +6383,7 @@ namespace MediaBrowser.Controller.MediaEncoding
         // ====================================================================
         // Returns true when the encoder pipeline should preserve HDR rather
         // than tonemap to SDR. Gated on environment variable
-        // JELLYFIN_ALLOW_HDR_TRANSCODE=1 for safe rollout. Once verified, this
+        // LIDSLABS_ALLOW_HDR_TRANSCODE=1 for safe rollout. Once verified, this
         // gate will move to EncodingOptions.AllowHdrTranscoding and become a
         // user-toggleable setting in the admin dashboard.
         //
@@ -6458,8 +6458,8 @@ namespace MediaBrowser.Controller.MediaEncoding
                 return false;
             }
 
-            // Environment-variable gate. Set JELLYFIN_ALLOW_HDR_TRANSCODE=1 to enable.
-            var envFlag = Environment.GetEnvironmentVariable("JELLYFIN_ALLOW_HDR_TRANSCODE");
+            // Environment-variable gate. Set LIDSLABS_ALLOW_HDR_TRANSCODE=1 to enable.
+            var envFlag = Environment.GetEnvironmentVariable("LIDSLABS_ALLOW_HDR_TRANSCODE");
             if (string.IsNullOrEmpty(envFlag))
             {
                 return false;
