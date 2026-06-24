@@ -8,11 +8,13 @@ using Jellyfin.Api.Attributes;
 using Jellyfin.Api.Extensions;
 using Jellyfin.Api.Helpers;
 using Jellyfin.Api.Models.MediaInfoDtos;
+using Jellyfin.Data.Enums;
 using Jellyfin.Extensions;
 using MediaBrowser.Common.Extensions;
 using MediaBrowser.Controller.Devices;
 using MediaBrowser.Controller.Entities;
 using MediaBrowser.Controller.Library;
+using MediaBrowser.Model.Dlna;
 using MediaBrowser.Model.MediaInfo;
 using Microsoft.AspNetCore.Authorization;
 using Microsoft.AspNetCore.Http;
@@ -146,6 +148,17 @@ public class MediaInfoController : BaseJellyfinApiController
             }
         }
 
+        // lidslabs v0.3: forced-HEVC override — source-independent gate.
+        // Computed here (profile is resolved); the HDR-source check and the
+        // actual TranscodingProfile rewrite happen below, once info.MediaSources exists.
+        var lidslabsForceHevcEligible =
+            LidslabsHdrTranscodeEnabled()
+            && profile is not null
+            && LidslabsClientMatches(
+                profile.Name,
+                Environment.GetEnvironmentVariable("LIDSLABS_TRANSCODER_FORCE_HEVC_CLIENTS"))
+            && LidslabsProfileClaimsHevc(profile);
+
         // Copy params from posted body
         // TODO clean up when breaking API compatibility.
         userId ??= playbackInfoDto?.UserId;
@@ -188,6 +201,27 @@ public class MediaInfoController : BaseJellyfinApiController
 
         if (profile is not null)
         {
+            // lidslabs v0.3: if eligible and any source is HDR, force HEVC to the
+            // front of the video TranscodingProfiles so the v0.2 HDR-passthrough
+            // path engages instead of h264+tonemap-to-SDR. Mutates the shared
+            // profile once per request (acceptable for single-version library items).
+            if (lidslabsForceHevcEligible
+                && info.MediaSources.Any(ms => ms.VideoStream?.VideoRange == VideoRange.HDR))
+            {
+                foreach (var tp in profile.TranscodingProfiles.Where(t => t.Type == DlnaProfileType.Video))
+                {
+                    var codecs = LidslabsSplitTrim(tp.VideoCodec)
+                        .Where(c => !string.Equals(c, "hevc", StringComparison.OrdinalIgnoreCase));
+                    tp.VideoCodec = string.Join(",", new[] { "hevc" }.Concat(codecs));
+                }
+
+                _logger.LogInformation(
+                    "lidslabs: forced HEVC override fired for profile={ProfileName}, ua={UserAgent}, item={ItemId}",
+                    profile.Name,
+                    Request.Headers.UserAgent.ToString(),
+                    itemId);
+            }
+
             // set device specific data
             foreach (var mediaSource in info.MediaSources)
             {
@@ -246,6 +280,75 @@ public class MediaInfoController : BaseJellyfinApiController
         }
 
         return info;
+
+        // lidslabs v0.3 helpers (static local functions — no instance capture).
+
+        // Mirrors the master-toggle read in EncodingHelper (v0.2). Source of truth:
+        // MediaBrowser.Controller/MediaEncoding/EncodingHelper.cs — accepts "1" or
+        // "true" (case-insensitive). Keep in sync if that rule changes; the two
+        // features must agree on what "on" means or the override fragments silently.
+        static bool LidslabsHdrTranscodeEnabled()
+        {
+            var envFlag = Environment.GetEnvironmentVariable("JELLYFIN_ALLOW_HDR_TRANSCODE");
+            if (string.IsNullOrEmpty(envFlag))
+            {
+                return false;
+            }
+
+            return string.Equals(envFlag, "1", StringComparison.Ordinal)
+                || string.Equals(envFlag, "true", StringComparison.OrdinalIgnoreCase);
+        }
+
+        static string[] LidslabsSplitTrim(string? value)
+            => (value ?? string.Empty).Split(',', StringSplitOptions.RemoveEmptyEntries | StringSplitOptions.TrimEntries);
+
+        // Maps user-facing client names (e.g. "neptune", "streamyfin") to the
+        // internal profile.Name substring(s) that identify each Jellyfin client
+        // mode. Keeps the env var ergonomic while letting us match the actual
+        // DeviceProfile field that distinguishes client modes from one another
+        // (Trident vs AV Player both ship in the Neptune app with the same UA
+        // but different profile.Name values).
+        //
+        // To add a verified-working client mode: add a switch arm mapping its
+        // friendly name to the distinguishing profile.Name substring. To
+        // disable a previously-supported client without breaking existing
+        // configs: comment out the arm — unmapped friendly names silently
+        // return false, equivalent to "this client mode no longer gets the
+        // override."
+        static bool LidslabsClientMatches(string? profileName, string? csv)
+        {
+            if (string.IsNullOrWhiteSpace(profileName) || string.IsNullOrWhiteSpace(csv))
+            {
+                return false;
+            }
+
+            foreach (var friendly in LidslabsSplitTrim(csv))
+            {
+                var matched = friendly.ToLowerInvariant() switch
+                {
+                    "neptune" => profileName.Contains("Trident", StringComparison.OrdinalIgnoreCase),
+                    "streamyfin" => profileName.Contains("1. MPV", StringComparison.OrdinalIgnoreCase),
+                    // "neptune_av" intentionally not mapped — Neptune AV Player
+                    //     declares HEVC HDR10 capability but cannot render HLS
+                    //     HEVC HDR10 streams in testing. Investigation lives
+                    //     on the feature/force-hevc-av-player-investigation
+                    //     branch; this arm gets added if/when that work lands.
+                    _ => false,
+                };
+
+                if (matched)
+                {
+                    return true;
+                }
+            }
+
+            return false;
+        }
+
+        static bool LidslabsProfileClaimsHevc(DeviceProfile p)
+            => p.DirectPlayProfiles.Any(dp => LidslabsSplitTrim(dp.VideoCodec).Contains("hevc", StringComparer.OrdinalIgnoreCase))
+                || p.TranscodingProfiles.Any(tp => LidslabsSplitTrim(tp.VideoCodec).Contains("hevc", StringComparer.OrdinalIgnoreCase))
+                || p.CodecProfiles.Any(cp => LidslabsSplitTrim(cp.Codec).Contains("hevc", StringComparer.OrdinalIgnoreCase));
     }
 
     /// <summary>
