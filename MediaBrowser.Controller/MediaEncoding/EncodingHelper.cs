@@ -7611,60 +7611,79 @@ namespace MediaBrowser.Controller.MediaEncoding
                 // Audio compatibility-track redirect (lidslabs custom)
                 // ============================================================
                 // PROBLEM: When the originally-selected audio track is TrueHD,
-                // MLP, or DTS-HD MA and the output is HLS, Jellyfin reports
-                // CanStreamCopyAudio == true and either muxes lossless audio in
-                // a way ExoPlayer clients struggle with, or falls back to
-                // transcoding the audio to AAC (which is lossy and loses
-                // surround channels). Symptom: audio decodes briefly then
-                // stalls, or plays as compressed AAC. Either way, the user
-                // experience is poor.
+                // MLP, or DTS-HD MA and the output is HLS or Progressive,
+                // Jellyfin either muxes lossless audio in a way client players
+                // struggle with, or falls back to transcoding it to AAC
+                // (lossy, surround-degraded). Symptom on HLS clients
+                // (Streamyfin, Moonfin): audio decodes briefly then stalls, or
+                // plays as compressed AAC. Symptom on Progressive
+                // MKV-over-HTTP clients (Neptune Trident): TrueHD transcoded
+                // to AAC 5.1 at 640 kbps, also lossy and surround-degraded.
                 //
-                // FIX: When the output is HLS AND the selected audio codec is
-                // truehd/mlp/dts, scan for a same-language multi-channel AC3 or
-                // E-AC3 track in the same file. If one exists, redirect
-                // state.AudioStream to it - the AC3/E-AC3 track stream-copies
-                // cleanly into HLS on every client that handles HLS at all,
-                // delivering full surround sound losslessly without any
-                // re-encoding.
+                // FIX: When the output is HLS or Progressive AND the selected
+                // audio codec is truehd/mlp/dts, scan for a same-language
+                // multi-channel AC3 or E-AC3 track in the same file and
+                // redirect state.AudioStream to it. The AC3/E-AC3 track
+                // stream-copies cleanly into HLS-TS, HLS-fMP4, MKV, and MP4
+                // on every client that handles those containers at all -
+                // AC3/E-AC3 are universally container-portable.
                 //
                 // Gating (all must hold for the redirect to fire):
                 //   1. We have a non-null AudioStream.
-                //   2. Output is HLS (state.TranscodingType == Hls).
+                //   2. Output is HLS or Progressive (state.TranscodingType).
+                //      Dash is not covered; widen only when we have a Dash
+                //      client to test against.
                 //   3. Original codec is truehd, mlp, or dts.
                 //   4. At least one alternative track exists where:
-                //        - codec is ac3 or eac3 (universally HLS-friendly)
+                //        - codec is ac3 or eac3
                 //        - channels >= 6 (excludes 2-channel commentary tracks)
                 //        - language matches the originally-selected track
                 //
-                // IMPORTANT: We deliberately do NOT gate on CanStreamCopyAudio
-                // anywhere here. At this point in AttachMediaSourceInfo,
-                // state.SupportedAudioCodecs is still the empty array set by
-                // the EncodingJobInfo constructor - it's populated ~70 lines
-                // later. An earlier revision of this patch checked Length > 0
-                // and silently skipped because of this ordering. AC3/E-AC3 are
-                // universally stream-copyable into HLS, so the per-client
-                // capability check is unnecessary anyway.
+                // IMPORTANT: We deliberately do NOT gate on
+                // state.SupportedAudioCodecs anywhere here. At this point in
+                // AttachMediaSourceInfo, state.SupportedAudioCodecs is still
+                // the empty array set by the EncodingJobInfo constructor -
+                // it's populated ~70 lines later. An earlier revision of this
+                // patch checked Length > 0 and silently skipped because of
+                // this ordering.
+                //
+                // We also deliberately do NOT gate on videoRequest.AudioCodec.
+                // For HLS segment requests, StreamBuilder narrows that list
+                // to the single codec it decided to transcode to (typically
+                // just "aac"), not the client's full DeviceProfile capability
+                // list. Gating substitution on the narrowed value silently
+                // blocks the redirect for any HLS client whose StreamBuilder
+                // picked AAC as the transcode target - which is most HLS
+                // clients on a TrueHD source. An early v0.3.1 iteration added
+                // this gate as a "defensive" check and it broke Streamyfin's
+                // working v0.2 substitution path. The right capability signal
+                // is DeviceProfile.TranscodingProfile.AudioCodec, which lives
+                // in MediaInfoController scope; routing it into
+                // AttachMediaSourceInfo is a larger refactor. For now we
+                // trust the universal compatibility of AC3/E-AC3, which
+                // matches the original v0.2 design intent.
                 //
                 // Tie-breaker: lowest stream index (compatibility tracks are
                 // conventionally ordered before commentary tracks in the file).
                 //
                 // No-op cases that fall through to normal behavior:
                 //   - Direct play (this whole method isn't on that path)
-                //   - Non-HLS output (e.g. progressive transcode)
-                //   - Selected track is AC3/E-AC3/AAC etc. (already HLS-friendly)
+                //   - Dash output
+                //   - Selected track is AC3/E-AC3/AAC etc. (already friendly)
                 //   - No AC3/E-AC3 6+ channel same-language alternative exists
                 //     (TrueHD-only files, DTS-HD MA without AC3 fallback,
                 //      foreign-language only tracks like Parasite French TrueHD).
                 if (state.AudioStream is not null
-                    && state.TranscodingType == TranscodingJobType.Hls)
+                    && (state.TranscodingType == TranscodingJobType.Hls
+                        || state.TranscodingType == TranscodingJobType.Progressive))
                 {
                     var originalCodec = state.AudioStream.Codec ?? string.Empty;
-                    var isProblematicInFmp4 =
+                    var isProblematicLosslessSource =
                         string.Equals(originalCodec, "truehd", StringComparison.OrdinalIgnoreCase)
                         || string.Equals(originalCodec, "mlp", StringComparison.OrdinalIgnoreCase)
                         || string.Equals(originalCodec, "dts", StringComparison.OrdinalIgnoreCase);
 
-                    if (isProblematicInFmp4)
+                    if (isProblematicLosslessSource)
                     {
                         var originalLanguage = state.AudioStream.Language;
 
