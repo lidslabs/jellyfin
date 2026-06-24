@@ -159,6 +159,22 @@ public class MediaInfoController : BaseJellyfinApiController
                 Environment.GetEnvironmentVariable("LIDSLABS_FORCE_HEVC_CLIENTS"))
             && LidslabsProfileClaimsHevc(profile);
 
+        // lidslabs v0.3: gate-decision diagnostic log. Logs at Debug, so it is
+        // silent in a default (Information-level) build and emits nothing in
+        // production. Raise the log level to Debug to diagnose a "the override
+        // doesn't fire for client X" report in a single cycle — it dumps the
+        // gate inputs (profile name, configured client list, master toggle,
+        // HEVC capability) and the eligibility result, distinguishing "patch
+        // absent from build" from "a gate failed". See DECISIONS.md,
+        // "Diagnostic logging at the eligibility point".
+        _logger.LogDebug(
+            "lidslabs.forceHevc gate: profile={ProfileName}, clients={Clients}, hdrEnabled={HdrEnabled}, profileHevc={ProfileHevc}, eligible={Eligible}",
+            profile?.Name,
+            Environment.GetEnvironmentVariable("LIDSLABS_FORCE_HEVC_CLIENTS"),
+            LidslabsHdrTranscodeEnabled(),
+            profile is not null && LidslabsProfileClaimsHevc(profile),
+            lidslabsForceHevcEligible);
+
         // Copy params from posted body
         // TODO clean up when breaking API compatibility.
         userId ??= playbackInfoDto?.UserId;
