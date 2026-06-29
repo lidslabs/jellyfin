@@ -175,6 +175,27 @@ public class MediaInfoController : BaseJellyfinApiController
             profile is not null && LidslabsProfileClaimsHevc(profile),
             lidslabsForceHevcEligible);
 
+        // lidslabs: forced-HLS override — transport lever, source-independent.
+        // Some clients only advertise HEVC on a progressive (http) transcoding
+        // profile and restrict their HLS profile to h264 (e.g. Neptune Trident:
+        // mkv/http=hevc, mp4/hls=h264). Their HEVC transcode therefore goes
+        // progressive, which the player buffers heavily (~10s) before playback.
+        // For matched clients, flip their progressive video profiles to HLS below
+        // so the player can start after the first segment instead. Reuses the
+        // forced-HEVC friendly-name → profile.Name mapping; gated on its own
+        // LIDSLABS_FORCE_HLS_CLIENTS list.
+        var lidslabsForceHlsEligible =
+            profile is not null
+            && LidslabsClientMatches(
+                profile.Name,
+                Environment.GetEnvironmentVariable("LIDSLABS_FORCE_HLS_CLIENTS"));
+
+        _logger.LogDebug(
+            "lidslabs.forceHls gate: profile={ProfileName}, clients={Clients}, eligible={Eligible}",
+            profile?.Name,
+            Environment.GetEnvironmentVariable("LIDSLABS_FORCE_HLS_CLIENTS"),
+            lidslabsForceHlsEligible);
+
         // Copy params from posted body
         // TODO clean up when breaking API compatibility.
         userId ??= playbackInfoDto?.UserId;
@@ -233,6 +254,31 @@ public class MediaInfoController : BaseJellyfinApiController
 
                 _logger.LogInformation(
                     "lidslabs: forced HEVC override fired for profile={ProfileName}, ua={UserAgent}, item={ItemId}",
+                    profile.Name,
+                    Request.Headers.UserAgent.ToString(),
+                    itemId);
+            }
+
+            // lidslabs: flip this client's progressive (http) video transcoding
+            // profiles to HLS so StreamBuilder delivers segments instead of one
+            // progressive stream. HLS needs a segmentable container; mkv is not
+            // valid, so normalize to ts (matches the working HLS clients). Runs
+            // after the forced-HEVC rewrite, so a flipped profile already carries
+            // hevc when that override is also active.
+            if (lidslabsForceHlsEligible)
+            {
+                var lidslabsHlsFlipped = 0;
+                foreach (var tp in profile.TranscodingProfiles.Where(t =>
+                    t.Type == DlnaProfileType.Video && t.Protocol == MediaStreamProtocol.http))
+                {
+                    tp.Protocol = MediaStreamProtocol.hls;
+                    tp.Container = "ts";
+                    lidslabsHlsFlipped++;
+                }
+
+                _logger.LogInformation(
+                    "lidslabs: forced HLS override flipped {Count} video profile(s) to HLS for profile={ProfileName}, ua={UserAgent}, item={ItemId}",
+                    lidslabsHlsFlipped,
                     profile.Name,
                     Request.Headers.UserAgent.ToString(),
                     itemId);
