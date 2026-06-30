@@ -26,6 +26,7 @@ using MediaBrowser.Model.Dto;
 using MediaBrowser.Model.Entities;
 using MediaBrowser.Model.MediaInfo;
 using Microsoft.Extensions.Configuration;
+using Microsoft.Extensions.Logging;
 using IConfigurationManager = MediaBrowser.Common.Configuration.IConfigurationManager;
 
 namespace MediaBrowser.Controller.MediaEncoding
@@ -63,6 +64,7 @@ namespace MediaBrowser.Controller.MediaEncoding
         private readonly IConfiguration _config;
         private readonly IConfigurationManager _configurationManager;
         private readonly IPathManager _pathManager;
+        private readonly ILogger<EncodingHelper> _logger;
 
         // i915 hang was fixed by linux 6.2 (3f882f2)
         private readonly Version _minKerneli915Hang = new Version(5, 18);
@@ -162,7 +164,8 @@ namespace MediaBrowser.Controller.MediaEncoding
             ISubtitleEncoder subtitleEncoder,
             IConfiguration config,
             IConfigurationManager configurationManager,
-            IPathManager pathManager)
+            IPathManager pathManager,
+            ILogger<EncodingHelper> logger)
         {
             _appPaths = appPaths;
             _mediaEncoder = mediaEncoder;
@@ -170,6 +173,7 @@ namespace MediaBrowser.Controller.MediaEncoding
             _config = config;
             _configurationManager = configurationManager;
             _pathManager = pathManager;
+            _logger = logger;
         }
 
         private enum DynamicHdrMetadataRemovalPlan
@@ -6819,9 +6823,23 @@ namespace MediaBrowser.Controller.MediaEncoding
                 {
                     if (options.EnableEnhancedNvdecDecoder)
                     {
+                        // lidslabs HDR coexistence: enhanced NVDEC's "+unsafe_output" hands NVENC the
+                        // decoder's internal, un-copied CUDA surfaces. Our HDR passthrough routes them
+                        // through a no-op scale_cuda=p010 (a passthrough that allocates nothing) straight
+                        // into NVENC, which pins the decoder's finite surface pool -> cuvidMapVideoFrame
+                        // fails with CUDA_ERROR_MAP_FAILED (black screen / first-frame freeze). SDR is
+                        // immune because its scale_cuda format conversion reallocates and frees the
+                        // surface. Drop ONLY this flag for the HDR triad; the enhanced (native nvdec)
+                        // decoder itself is retained, and every non-HDR path is byte-identical.
+                        var dropUnsafeOutputForHdr = nvdecNoInternalCopy && IsHdrPassthroughMode(state);
+                        if (dropUnsafeOutputForHdr)
+                        {
+                            _logger.LogDebug("lidslabs HDR passthrough on NVENC: dropping enhanced-NVDEC '-hwaccel_flags +unsafe_output' to prevent CUDA_ERROR_MAP_FAILED with the p010 passthrough surface chain");
+                        }
+
                         // set -threads 1 to nvdec decoder explicitly since it doesn't implement threading support.
                         return " -hwaccel cuda" + (outputHwSurface ? " -hwaccel_output_format cuda -noautorotate" + stripRotationDataArgs : string.Empty)
-                            + (nvdecNoInternalCopy ? " -hwaccel_flags +unsafe_output" : string.Empty) + " -threads 1" + (isAv1 ? " -c:v av1" : string.Empty);
+                            + (nvdecNoInternalCopy && !dropUnsafeOutputForHdr ? " -hwaccel_flags +unsafe_output" : string.Empty) + " -threads 1" + (isAv1 ? " -c:v av1" : string.Empty);
                     }
 
                     // cuvid decoder doesn't have threading issue.
