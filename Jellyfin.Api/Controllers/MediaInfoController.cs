@@ -148,12 +148,21 @@ public class MediaInfoController : BaseJellyfinApiController
             }
         }
 
-        // lidslabs v0.3: forced-HEVC override — source-independent gate.
-        // Computed here (profile is resolved); the HDR-source check and the
-        // actual TranscodingProfile rewrite happen below, once info.MediaSources exists.
+        // lidslabs v0.3.2: forced-HEVC override — source-independent and gated on
+        // its OWN enable. This is a codec *preference* lever, not part of HDR
+        // enablement: it fires whenever a client in LIDSLABS_FORCE_HEVC_CLIENTS
+        // advertises HEVC, for ANY source (SDR or HDR). It is deliberately NOT
+        // gated on LIDSLABS_ALLOW_HDR_TRANSCODE — forcing HEVC on an SDR remux
+        // (the original FORCE_HEVC intent) has nothing to do with the HDR master
+        // toggle. Keeping the two independent means the base HDR-passthrough
+        // feature (governed solely by LIDSLABS_ALLOW_HDR_TRANSCODE inside
+        // IsHdrPassthroughMode) always fires on its own terms, and this lever can
+        // never enable or disable it. The safeguard is unchanged: the override
+        // never invents capability — LidslabsProfileClaimsHevc still requires the
+        // client to advertise HEVC. Computed here (profile is resolved); the
+        // TranscodingProfile rewrite happens below, once info.MediaSources exists.
         var lidslabsForceHevcEligible =
-            LidslabsHdrTranscodeEnabled()
-            && profile is not null
+            profile is not null
             && LidslabsClientMatches(
                 profile.Name,
                 Environment.GetEnvironmentVariable("LIDSLABS_FORCE_HEVC_CLIENTS"))
@@ -163,15 +172,15 @@ public class MediaInfoController : BaseJellyfinApiController
         // silent in a default (Information-level) build and emits nothing in
         // production. Raise the log level to Debug to diagnose a "the override
         // doesn't fire for client X" report in a single cycle — it dumps the
-        // gate inputs (profile name, configured client list, master toggle,
-        // HEVC capability) and the eligibility result, distinguishing "patch
-        // absent from build" from "a gate failed". See DECISIONS.md,
+        // gate inputs (profile name, configured client list, HEVC capability)
+        // and the eligibility result, distinguishing "patch absent from build"
+        // from "a gate failed". (The HDR master toggle is intentionally NOT a
+        // gate input here — see the eligibility note above.) See DECISIONS.md,
         // "Diagnostic logging at the eligibility point".
         _logger.LogDebug(
-            "lidslabs.forceHevc gate: profile={ProfileName}, clients={Clients}, hdrEnabled={HdrEnabled}, profileHevc={ProfileHevc}, eligible={Eligible}",
+            "lidslabs.forceHevc gate: profile={ProfileName}, clients={Clients}, profileHevc={ProfileHevc}, eligible={Eligible}",
             profile?.Name,
             Environment.GetEnvironmentVariable("LIDSLABS_FORCE_HEVC_CLIENTS"),
-            LidslabsHdrTranscodeEnabled(),
             profile is not null && LidslabsProfileClaimsHevc(profile),
             lidslabsForceHevcEligible);
 
@@ -250,12 +259,17 @@ public class MediaInfoController : BaseJellyfinApiController
 
         if (profile is not null)
         {
-            // lidslabs v0.3: if eligible and any source is HDR, force HEVC to the
-            // front of the video TranscodingProfiles so the v0.2 HDR-passthrough
-            // path engages instead of h264+tonemap-to-SDR. Mutates the shared
-            // profile once per request (acceptable for single-version library items).
-            if (lidslabsForceHevcEligible
-                && info.MediaSources.Any(ms => ms.VideoStream?.VideoRange == VideoRange.HDR))
+            // lidslabs v0.3.2: if eligible, force HEVC to the front of the video
+            // TranscodingProfiles so StreamBuilder picks HEVC over the client-listed
+            // h264 — for ANY source, SDR or HDR (source-independent, matching the
+            // FORCE_HEVC name; the old HDR-source gate silently no-op'd on SDR). On
+            // an HDR source the v0.2 HDR-passthrough path then engages per
+            // LIDSLABS_ALLOW_HDR_TRANSCODE; on an SDR source this is a clean HEVC-SDR
+            // encode — IsHdrPassthroughMode bails on the source range (!= HDR) before
+            // it looks at the output codec, so nothing wanders into HDR colour/tonemap
+            // routing. Mutates the shared profile once per request (acceptable for
+            // single-version library items).
+            if (lidslabsForceHevcEligible)
             {
                 foreach (var tp in profile.TranscodingProfiles.Where(t => t.Type == DlnaProfileType.Video))
                 {
@@ -451,22 +465,6 @@ public class MediaInfoController : BaseJellyfinApiController
         return info;
 
         // lidslabs v0.3 helpers (static local functions — no instance capture).
-
-        // Mirrors the master-toggle read in EncodingHelper (v0.2). Source of truth:
-        // MediaBrowser.Controller/MediaEncoding/EncodingHelper.cs — accepts "1" or
-        // "true" (case-insensitive). Keep in sync if that rule changes; the two
-        // features must agree on what "on" means or the override fragments silently.
-        static bool LidslabsHdrTranscodeEnabled()
-        {
-            var envFlag = Environment.GetEnvironmentVariable("LIDSLABS_ALLOW_HDR_TRANSCODE");
-            if (string.IsNullOrEmpty(envFlag))
-            {
-                return false;
-            }
-
-            return string.Equals(envFlag, "1", StringComparison.Ordinal)
-                || string.Equals(envFlag, "true", StringComparison.OrdinalIgnoreCase);
-        }
 
         static string[] LidslabsSplitTrim(string? value)
             => (value ?? string.Empty).Split(',', StringSplitOptions.RemoveEmptyEntries | StringSplitOptions.TrimEntries);
