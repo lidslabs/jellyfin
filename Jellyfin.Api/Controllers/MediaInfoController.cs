@@ -285,6 +285,38 @@ public class MediaInfoController : BaseJellyfinApiController
                     itemId);
             }
 
+            // lidslabs v0.3.2 (patch 0009): Neptune AV Player is AVPlayer-on-tvOS,
+            // the same renderer class as Swiftfin. When AV Player is the forced
+            // client, also rewrite its video HLS container ts->mp4 so the forced
+            // codec is delivered as fMP4 (CMAF), the Apple-native HLS path — the
+            // same transport fix applied to Swiftfin above. This is a TRANSPORT
+            // rewrite, codec-agnostic (the helper touches only Container, never the
+            // codec): it holds for HEVC today and for any codec a future
+            // preferred-codec lever forces (e.g. AV1), both undecodable in mpegts on
+            // AVPlayer. Keyed on the neptune_av client match (single source of truth
+            // for AV Player's name), not on "HEVC", so it stays correct if the force
+            // ever generalizes from HEVC to a preferred codec. No new env var — fMP4
+            // rides the same opt-in that forces the codec.
+            //
+            // INSURANCE, not the fix: the 2026-07-01 baseline showed AV Player's own
+            // video TranscodingProfile already declares Container=mp4 (it negotiates
+            // fMP4 natively), so LidslabsForceFmp4Hls is a no-op on that build and
+            // this block never fires. It is retained to defend against a future
+            // Neptune build that reverts its transcode container to ts, and to keep
+            // the AV Player path symmetric with Swiftfin. General rule: force fMP4
+            // whenever an Apple-TV AVPlayer client is forced to transcode over HLS.
+            // Second AVPlayer adopter after Swiftfin; a third should promote both
+            // call-sites to a shared code path (see FUTURE_REQUESTS.md).
+            if (lidslabsForceHevcEligible
+                && LidslabsClientMatches(profile.Name, "neptune_av")
+                && LidslabsForceFmp4Hls(profile))
+            {
+                _logger.LogInformation(
+                    "lidslabs: Neptune AV Player fMP4 HLS force applied (video TranscodingProfile container -> mp4) for profile={ProfileName}, item={ItemId}",
+                    profile.Name,
+                    itemId);
+            }
+
             // lidslabs v0.3.2: strip the TrueHD family (truehd/mlp) from Swiftfin's
             // audio direct-play profiles so a TrueHD track cannot direct-play to
             // silence. Mutates the shared profile once, pre-loop (kept out of the
@@ -495,11 +527,17 @@ public class MediaInfoController : BaseJellyfinApiController
                 {
                     "neptune" => profileName.Contains("Trident", StringComparison.OrdinalIgnoreCase),
                     "streamyfin" => profileName.Contains("1. MPV", StringComparison.OrdinalIgnoreCase),
-                    // "neptune_av" intentionally not mapped — Neptune AV Player
-                    //     declares HEVC HDR10 capability but cannot render HLS
-                    //     HEVC HDR10 streams in testing. Investigation lives
-                    //     on the feature/force-hevc-av-player-investigation
-                    //     branch; this arm gets added if/when that work lands.
+                    // lidslabs v0.3.2 (patch 0009): Neptune AV Player — the app's
+                    //     Apple-AVPlayer player mode. Name "Neptune tvOS" is a strict
+                    //     prefix of Trident's "Neptune tvOS (Trident)", so match on
+                    //     "Neptune tvOS" AND explicitly exclude "Trident" (single known
+                    //     collision). AV Player: true && !false = true; Trident:
+                    //     true && !true = false. The negation (vs Equals) keeps AV
+                    //     Player matched if a future build appends an unrelated suffix
+                    //     while Trident stays excluded. Both strings confirmed against a
+                    //     live capture (neptune/151, app 0.1.6) — DEBUG_LOG 2026-07-01.
+                    "neptune_av" => profileName.Contains("Neptune tvOS", StringComparison.OrdinalIgnoreCase)
+                                    && !profileName.Contains("Trident", StringComparison.OrdinalIgnoreCase),
                     _ => false,
                 };
 
