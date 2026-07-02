@@ -1843,9 +1843,25 @@ namespace MediaBrowser.Controller.MediaEncoding
                 // Level 5.0 is suitable for up to 4k 30fps hevc encoding, otherwise let the encoder to handle it.
                 // https://en.wikipedia.org/wiki/High_Efficiency_Video_Coding_tiers_and_levels
                 // MaxLumaSampleRate = 3840*2160*30 = 248832000 < 267386880.
-                if (requestLevel < 0 || requestLevel >= 150)
+                //
+                // lidslabs v0.3.2: the L5.0 cap is HEVC-spec-valid for 4k@<=30fps, but Apple
+                // AVPlayer (fMP4 HLS) REJECTS a 2160p stream whose CODECS advertises below
+                // Level 5.1: it maps 2160p -> minimum L5.1 regardless of the spec sample-rate
+                // math and refuses the master playlist (black screen; the client fetches the
+                // media playlist then never requests a segment, so ffmpeg never spawns). This
+                // is the exact analogue of the h264 branch below ("h264 4k 30fps requires at
+                // least level 5.1 otherwise it will break on safari fmp4"). For 2160p HEVC
+                // output, raise the cap to 5.1 (153) so the advertised level matches what the
+                // encoder actually produces (hevc_nvenc is not given -level and emits L5.1 for
+                // 4k). Sub-2160p output keeps the 5.0 cap, which preserves the Apple A10 SDR-HEVC
+                // compatibility the DynamicHlsHelper Level-5.0 fallback depends on. Client-agnostic
+                // manifest-correctness fix, not a per-client workaround. Verified 2026-07-01:
+                // 4k source advertised hvc1.2.4.L150.B0 -> Neptune AV Player + Moonfin black;
+                // 1080p transcode (L150) and Swiftfin's source-level copy (L153) both rendered.
+                var hevcLevelCap = (state.OutputHeight >= 2160 || state.OutputWidth >= 3840) ? 153 : 150;
+                if (requestLevel < 0 || requestLevel >= hevcLevelCap)
                 {
-                    return "150";
+                    return hevcLevelCap.ToString(CultureInfo.InvariantCulture);
                 }
             }
             else if (string.Equals(state.ActualOutputVideoCodec, "h264", StringComparison.OrdinalIgnoreCase))
