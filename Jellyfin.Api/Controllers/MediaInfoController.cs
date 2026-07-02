@@ -317,6 +317,81 @@ public class MediaInfoController : BaseJellyfinApiController
                     itemId);
             }
 
+            // lidslabs v0.3.2 (patch 0011): force listed clients back to SDR. Some
+            // AVPlayer-family tvOS clients (Neptune AV Player) advertise HDR10 HEVC
+            // but cannot ingest an HDR-over-HLS stream: they reject the master
+            // playlist's VIDEO-RANGE=PQ and never request a segment, so the screen
+            // stays black. The global HDR-passthrough path
+            // (LIDSLABS_ALLOW_HDR_TRANSCODE) hands HDR to every client regardless of
+            // whether it asked for it, which is what breaks them. Rather than match
+            // these clients by User-Agent at transcode time — where AV Player and
+            // Trident are indistinguishable (same app UA) — decide HERE at
+            // PlaybackInfo, where DeviceProfile.Name gives the collision-safe
+            // delineation ("Neptune tvOS" vs "Neptune tvOS (Trident)"), reusing the
+            // same LidslabsClientMatches map as the forced-HEVC lever. For a matched
+            // client we PREPEND a hevc CodecProfile pinning the transcode target range
+            // to SDR (Equals VideoRangeType=SDR). Prepend (not append) so it takes
+            // highest priority in StreamBuilder's reversed codec-profile walk and
+            // wins over any HDR10 range the client also declares. StreamBuilder then
+            // emits &VideoRangeType=SDR on the transcode URL; the paired guard in
+            // EncodingHelper.IsHdrPassthroughMode honors that requested SDR range and
+            // drops out of HDR passthrough, flipping the HLS master VIDEO-RANGE and
+            // the ffmpeg tonemap together. The forced HEVC codec is preserved — this
+            // is a colour-range downgrade (HDR->SDR tonemap), NOT a codec change, so
+            // efficiency is retained. Runtime-tunable via LIDSLABS_FORCE_SDR_CLIENTS
+            // (add/remove a client with a compose edit + restart, no image rebuild).
+            // Inert on SDR sources: the Equals-SDR condition is already satisfied, so
+            // nothing is forced and direct-play/copy is unaffected. Idempotent:
+            // skipped if this hevc Equals-SDR pin is already present.
+            var lidslabsForceSdrEligible =
+                LidslabsClientMatches(
+                    profile.Name,
+                    Environment.GetEnvironmentVariable("LIDSLABS_FORCE_SDR_CLIENTS"));
+
+            // Gate-decision diagnostic (Debug; dormant at Information level, like the
+            // forced-HEVC gate above). Raise the level to Debug to confirm whether a
+            // client is seen as force-SDR-eligible in a single cycle.
+            _logger.LogDebug(
+                "lidslabs.forceSdr gate: profile={ProfileName}, clients={Clients}, eligible={Eligible}",
+                profile.Name,
+                Environment.GetEnvironmentVariable("LIDSLABS_FORCE_SDR_CLIENTS"),
+                lidslabsForceSdrEligible);
+
+            if (lidslabsForceSdrEligible)
+            {
+                var alreadyForcedSdr = profile.CodecProfiles
+                    .Where(cp => cp.Type == CodecType.Video
+                                 && LidslabsSplitTrim(cp.Codec).Contains("hevc", StringComparer.OrdinalIgnoreCase))
+                    .Any(cp => cp.Conditions.Any(c =>
+                        c.Property == ProfileConditionValue.VideoRangeType
+                        && c.Condition == ProfileConditionType.Equals
+                        && string.Equals(c.Value, "SDR", StringComparison.OrdinalIgnoreCase)));
+
+                if (!alreadyForcedSdr)
+                {
+                    var forceSdr = new CodecProfile
+                    {
+                        Type = CodecType.Video,
+                        Codec = "hevc",
+                        Conditions = new[]
+                        {
+                            new ProfileCondition(
+                                ProfileConditionType.Equals,
+                                ProfileConditionValue.VideoRangeType,
+                                "SDR",
+                                false),
+                        },
+                    };
+
+                    profile.CodecProfiles = new[] { forceSdr }.Concat(profile.CodecProfiles).ToArray();
+
+                    _logger.LogInformation(
+                        "lidslabs: forced-SDR override applied (prepended hevc VideoRangeType=SDR) for profile={ProfileName}, item={ItemId}",
+                        profile.Name,
+                        itemId);
+                }
+            }
+
             // lidslabs v0.3.2: strip the TrueHD family (truehd/mlp) from Swiftfin's
             // audio direct-play profiles so a TrueHD track cannot direct-play to
             // silence. Mutates the shared profile once, pre-loop (kept out of the
@@ -538,6 +613,14 @@ public class MediaInfoController : BaseJellyfinApiController
                     //     live capture (neptune/151, app 0.1.6) — DEBUG_LOG 2026-07-01.
                     "neptune_av" => profileName.Contains("Neptune tvOS", StringComparison.OrdinalIgnoreCase)
                                     && !profileName.Contains("Trident", StringComparison.OrdinalIgnoreCase),
+                    // Moonfin (DeviceProfile.Name "Moonfin") is intentionally NOT mapped.
+                    //     It black-screens HDR titles too, but the 2026-07-02 dev capture
+                    //     proved force-SDR does not fix it: its master.m3u8 returns HTTP 400
+                    //     on both the HDR DV source AND a plain H264 SDR source (so the
+                    //     failure is not HDR-related and force-SDR is a no-op for it). Its
+                    //     black screen is a separate fMP4/manifest bug, tracked apart from
+                    //     patch 0011. Add an arm here only if that is ever root-caused and a
+                    //     range downgrade is shown to help. See DEBUG_LOG.md 2026-07-02.
                     _ => false,
                 };
 
