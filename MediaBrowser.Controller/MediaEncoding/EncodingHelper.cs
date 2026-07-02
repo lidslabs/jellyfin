@@ -6478,6 +6478,29 @@ namespace MediaBrowser.Controller.MediaEncoding
                 return false;
             }
 
+            // lidslabs v0.3.2 (patch 0011): honor an explicit SDR output request.
+            // Without this, IsHdrPassthroughMode ignores the client's requested range
+            // and forces HDR passthrough onto every eligible HDR source — which
+            // black-screens AVPlayer-family tvOS clients that cannot ingest
+            // HDR-over-HLS (they reject the master playlist's VIDEO-RANGE=PQ). When
+            // the negotiated transcode target range is SDR — pinned via the
+            // VideoRangeType=SDR CodecProfile that the PlaybackInfo
+            // LIDSLABS_FORCE_SDR_CLIENTS lever injects, or requested by any client
+            // that genuinely wants SDR — drop out of passthrough and let the stock
+            // tonemap path run. Because this is the single gate authoring BOTH the HLS
+            // master VIDEO-RANGE (DynamicHlsHelper) and the ffmpeg filter chain, the
+            // manifest and the encode flip to SDR together — no PQ-manifest /
+            // tonemapped-segment mismatch. Only the colour range is downgraded; the
+            // output codec (e.g. forced HEVC) is unchanged, so efficiency is retained.
+            // A request that specifies no range (or a non-SDR range like HDR10) is
+            // untouched — passthrough still fires on its own terms.
+            var requestedRangeTypes = state.GetRequestedRangeTypes(targetCodec);
+            if (requestedRangeTypes.Length > 0
+                && requestedRangeTypes.All(r => string.Equals(r, "SDR", StringComparison.OrdinalIgnoreCase)))
+            {
+                return false;
+            }
+
             // Environment-variable gate. Set LIDSLABS_ALLOW_HDR_TRANSCODE=1 to enable.
             var envFlag = Environment.GetEnvironmentVariable("LIDSLABS_ALLOW_HDR_TRANSCODE");
             if (string.IsNullOrEmpty(envFlag))
