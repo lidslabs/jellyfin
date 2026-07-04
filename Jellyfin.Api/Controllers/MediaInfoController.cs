@@ -695,14 +695,22 @@ public class MediaInfoController : BaseJellyfinApiController
                     //     live capture (neptune/151, app 0.1.6) — DEBUG_LOG 2026-07-01.
                     "neptune_av" => profileName.Contains("Neptune tvOS", StringComparison.OrdinalIgnoreCase)
                                     && !profileName.Contains("Trident", StringComparison.OrdinalIgnoreCase),
-                    // Moonfin (DeviceProfile.Name "Moonfin") is intentionally NOT mapped.
-                    //     It black-screens HDR titles too, but the 2026-07-02 dev capture
-                    //     proved force-SDR does not fix it: its master.m3u8 returns HTTP 400
-                    //     on both the HDR DV source AND a plain H264 SDR source (so the
-                    //     failure is not HDR-related and force-SDR is a no-op for it). Its
-                    //     black screen is a separate fMP4/manifest bug, tracked apart from
-                    //     patch 0011. Add an arm here only if that is ever root-caused and a
-                    //     range downgrade is shown to help. See DEBUG_LOG.md 2026-07-02.
+                    // lidslabs 2026-07-04: Moonfin (DeviceProfile.Name "Moonfin", client
+                    //     "Moonfin for tvOS", confirmed in the dev capture). Mapped so it
+                    //     can take the force-SDR lever. The earlier "intentionally NOT
+                    //     mapped" note was based on the 2026-07-02 black screen, which was a
+                    //     master.m3u8 HTTP 400 (self-rejected URL, fixed by patch 0012) —
+                    //     NOT an HDR problem. With playback working, Moonfin's HDR TRANSCODE
+                    //     washes out: its mpv render path cannot engage HDR (the
+                    //     outputProvidesHdr()/EDR-headroom gate — an upstream client bug that
+                    //     is NOT server-fixable). force-SDR converts that washout into a
+                    //     correct SDR image (HEVC preserved). The usual force-SDR side effect
+                    //     (it disqualifies HDR/DV DIRECT PLAY) has no path to hit here:
+                    //     Moonfin is used only by external, bitrate-limited clients that are
+                    //     always transcoding. "Moonfin" is collision-free vs "Trident" /
+                    //     "Neptune tvOS" / "1. MPV". See DEBUG_LOG.md 2026-07-04 and
+                    //     .project/moonfin-hdr-mpv-washout-issue.md.
+                    "moonfin" => profileName.Contains("Moonfin", StringComparison.OrdinalIgnoreCase),
                     _ => false,
                 };
 
