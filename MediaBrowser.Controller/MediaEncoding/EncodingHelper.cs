@@ -36,10 +36,15 @@ namespace MediaBrowser.Controller.MediaEncoding
         /// <summary>
         /// The codec validation regex string.
         /// This regular expression matches strings that consist of alphanumeric characters, hyphens,
-        /// periods, underscores, commas, and vertical bars, with a length between 0 and 40 characters.
+        /// periods, underscores, commas, and vertical bars, with a length between 0 and 80 characters.
         /// This should matches all common valid codecs.
+        /// lidslabs: widened from 40 to 80. The server's own StreamBuilder joins the full
+        /// _supportedHlsAudioCodecsMp4 allow-list ("aac,ac3,eac3,mp3,alac,flac,opus,dts,truehd" = 42)
+        /// into &amp;AudioCodec= for any client whose fMP4-HLS profile permits it (e.g. Moonfin), so the
+        /// endpoint's [ApiController] model validation rejected a URL the server itself produced (clean
+        /// HTTP 400 on master.m3u8, black screen). 80 clears the self-generated list with headroom.
         /// </summary>
-        public const string ContainerValidationRegexStr = @"^[a-zA-Z0-9\-\._,|]{0,40}$";
+        public const string ContainerValidationRegexStr = @"^[a-zA-Z0-9\-\._,|]{0,80}$";
 
         /// <summary>
         /// The level validation regex string.
