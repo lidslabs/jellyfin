@@ -15,6 +15,7 @@ using MediaBrowser.Controller.Devices;
 using MediaBrowser.Controller.Entities;
 using MediaBrowser.Controller.Library;
 using MediaBrowser.Model.Dlna;
+using MediaBrowser.Model.Entities;
 using MediaBrowser.Model.MediaInfo;
 using Microsoft.AspNetCore.Authorization;
 using Microsoft.AspNetCore.Http;
@@ -537,6 +538,107 @@ public class MediaInfoController : BaseJellyfinApiController
                     Request.HttpContext.GetNormalizedRemoteIP());
             }
 
+            // lidslabs v0.3.2: describe the DELIVERED stream, not the source, for a
+            // transcode of a DV/HDR source.
+            // Jellyfin returns the source MediaStreams verbatim even when the source is
+            // transcoded, so a client that keys its display pipeline off the reported
+            // VideoRangeType (e.g. Moonfin's tvOS DisplayCriteriaManager, which maps any
+            // "DOVI*" range to kCMVideoCodecType_DolbyVisionHEVC and any HDR range to a
+            // PQ/HLG HDMI mode) selects a display mode for the SOURCE and then receives
+            // bytes that don't match -> washed-out / wrong-gamut colors, plus a spurious
+            // Dolby Vision banner for DV. There are two delivered-range cases, keyed on
+            // what the transcode actually emits:
+            //
+            //   * force-SDR eligible (LIDSLABS_FORCE_SDR_CLIENTS): the HDR/DV source is
+            //     tonemapped to SDR (bt.709). Report SDR and clear the DV descriptors so
+            //     the client does NOT engage DV/HDR — no re-engaged DV mode, no DV banner
+            //     popped over a stream that is actually SDR.
+            //   * HDR passthrough (LIDSLABS_ALLOW_HDR_TRANSCODE, not force-SDR): a DV
+            //     source is passed through as clean HDR10/HLG (no RPU, no -dolby_vision;
+            //     the HLS master advertises VIDEO-RANGE=PQ), so flatten the DV
+            //     descriptors and the range resolves to HDR10 (smpte2084) / HLG
+            //     (arib-std-b67) from ColorTransfer, matching the bytes. A native
+            //     HDR10/HLG source already reports correctly and is left untouched.
+            //
+            // VideoRangeType is a COMPUTED property (MediaStream.GetVideoColorRange)
+            // derived from the DV fields + Hdr10PlusPresentFlag + ColorTransfer, so we
+            // rewrite those (and, for force-SDR, the color* metadata to bt.709 to mirror
+            // the ffmpeg tonemap output). This mutates only the per-request response
+            // clone (MediaInfoHelper deep-clones MediaSources before we touch them),
+            // never library metadata. Scope: transcode only (TranscodingUrl set). The
+            // play decision (SupportsDirectPlay / TranscodingUrl) is finalized above and
+            // is NOT changed here, so no client can flip to direct-playing off the
+            // rewritten range. Range only; a codec/profile rewrite is a separate follow-up.
+            if (lidslabsForceSdrEligible || LidslabsHdrTranscodeEnabled())
+            {
+                foreach (var mediaSource in info.MediaSources)
+                {
+                    if (string.IsNullOrEmpty(mediaSource.TranscodingUrl))
+                    {
+                        continue;
+                    }
+
+                    var videoStream = mediaSource.MediaStreams?
+                        .FirstOrDefault(s => s.Type == MediaStreamType.Video);
+                    if (videoStream is null)
+                    {
+                        continue;
+                    }
+
+                    // Read the computed range/range-class BEFORE clearing any fields.
+                    var rangeType = videoStream.VideoRangeType;
+                    var (videoRange, _) = videoStream.GetVideoColorRange();
+
+                    if (lidslabsForceSdrEligible)
+                    {
+                        // The transcode tonemaps to SDR. Only HDR/DV sources need the
+                        // rewrite; an SDR source already matches the SDR output.
+                        if (videoRange != VideoRange.HDR)
+                        {
+                            continue;
+                        }
+
+                        LidslabsClearDoViDescriptors(videoStream);
+                        // Flatten HDR color metadata to bt.709 so the range computes SDR
+                        // (mirrors the ffmpeg tonemap: bt709 primaries/transfer/matrix).
+                        videoStream.ColorPrimaries = "bt709";
+                        videoStream.ColorTransfer = "bt709";
+                        videoStream.ColorSpace = "bt709";
+                        videoStream.Hdr10PlusPresentFlag = null;
+
+                        _logger.LogInformation(
+                            "lidslabs: PlaybackInfo delivered-range rewrite (force-SDR: {SourceRange} -> SDR) for profile={ProfileName}, item={ItemId}",
+                            rangeType,
+                            profile.Name,
+                            itemId);
+                        continue;
+                    }
+
+                    // HDR passthrough: only DV ranges whose HDR10/HLG base survives
+                    // passthrough are eligible (bare DOVI profile 5 and DOVIWithSDR
+                    // tonemap to SDR — leave them; native HDR10/HLG already correct).
+                    var isPassthroughDovi =
+                        rangeType == VideoRangeType.DOVIWithHDR10
+                        || rangeType == VideoRangeType.DOVIWithEL
+                        || rangeType == VideoRangeType.DOVIWithHDR10Plus
+                        || rangeType == VideoRangeType.DOVIWithELHDR10Plus
+                        || rangeType == VideoRangeType.DOVIWithHLG
+                        || rangeType == VideoRangeType.DOVIInvalid;
+                    if (!isPassthroughDovi)
+                    {
+                        continue;
+                    }
+
+                    LidslabsClearDoViDescriptors(videoStream);
+
+                    _logger.LogInformation(
+                        "lidslabs: PlaybackInfo delivered-range rewrite (DV {SourceRange} -> HDR10/HLG passthrough) for profile={ProfileName}, item={ItemId}",
+                        rangeType,
+                        profile.Name,
+                        itemId);
+                }
+            }
+
             _mediaInfoHelper.SortMediaSources(info, maxStreamingBitrate);
         }
 
@@ -633,10 +735,52 @@ public class MediaInfoController : BaseJellyfinApiController
             return false;
         }
 
+        // lidslabs v0.3.2: strip the Dolby Vision descriptors from a
+        // response-clone video MediaStream so its COMPUTED VideoRangeType stops
+        // resolving to a DOVI* range. Shared by both delivered-range rewrite branches
+        // (force-SDR -> SDR, and HDR passthrough -> HDR10/HLG). Clears the DV metadata
+        // fields plus the dovi/dvh1/dvhe/dav1 CodecTag (GetVideoColorRange keys the DOVI
+        // branch off both). Mutates only the per-request clone, never library metadata.
+        static void LidslabsClearDoViDescriptors(MediaStream videoStream)
+        {
+            videoStream.DvProfile = null;
+            videoStream.DvLevel = null;
+            videoStream.RpuPresentFlag = null;
+            videoStream.ElPresentFlag = null;
+            videoStream.BlPresentFlag = null;
+            videoStream.DvBlSignalCompatibilityId = null;
+            videoStream.DvVersionMajor = null;
+            videoStream.DvVersionMinor = null;
+            if (string.Equals(videoStream.CodecTag, "dovi", StringComparison.OrdinalIgnoreCase)
+                || string.Equals(videoStream.CodecTag, "dvh1", StringComparison.OrdinalIgnoreCase)
+                || string.Equals(videoStream.CodecTag, "dvhe", StringComparison.OrdinalIgnoreCase)
+                || string.Equals(videoStream.CodecTag, "dav1", StringComparison.OrdinalIgnoreCase))
+            {
+                videoStream.CodecTag = null;
+            }
+        }
+
         static bool LidslabsProfileClaimsHevc(DeviceProfile p)
             => p.DirectPlayProfiles.Any(dp => LidslabsSplitTrim(dp.VideoCodec).Contains("hevc", StringComparer.OrdinalIgnoreCase))
                 || p.TranscodingProfiles.Any(tp => LidslabsSplitTrim(tp.VideoCodec).Contains("hevc", StringComparer.OrdinalIgnoreCase))
                 || p.CodecProfiles.Any(cp => LidslabsSplitTrim(cp.Codec).Contains("hevc", StringComparer.OrdinalIgnoreCase));
+
+        // lidslabs v0.3.2 (patch 0013): mirror the LIDSLABS_ALLOW_HDR_TRANSCODE gate
+        // parse from EncodingHelper.IsHdrPassthroughMode so PlaybackInfo can tell whether
+        // an eligible HDR/DV source will be delivered as HDR (passthrough) rather than
+        // tonemapped to SDR. Same accepted values ("1" / "true") the transcode path uses,
+        // so the delivered-range rewrite above never disagrees with what ffmpeg emits.
+        static bool LidslabsHdrTranscodeEnabled()
+        {
+            var envFlag = Environment.GetEnvironmentVariable("LIDSLABS_ALLOW_HDR_TRANSCODE");
+            if (string.IsNullOrEmpty(envFlag))
+            {
+                return false;
+            }
+
+            return string.Equals(envFlag, "1", StringComparison.Ordinal)
+                || string.Equals(envFlag, "true", StringComparison.OrdinalIgnoreCase);
+        }
 
         // Rewrites every video HLS TranscodingProfile's container to mp4 so the
         // resulting HLS stream is muxed as fMP4 (CMAF) instead of MPEG-TS. Apple
