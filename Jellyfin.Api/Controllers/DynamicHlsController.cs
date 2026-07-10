@@ -1,6 +1,8 @@
 using System;
+using System.Collections.Concurrent;
 using System.Collections.Generic;
 using System.ComponentModel.DataAnnotations;
+using System.Diagnostics;
 using System.Diagnostics.CodeAnalysis;
 using System.Globalization;
 using System.IO;
@@ -1407,7 +1409,9 @@ public class DynamicHlsController : BaseJellyfinApiController
 
     private async Task<ActionResult> GetVariantPlaylistInternal(StreamingRequestDto streamingRequest, CancellationTokenSource cancellationTokenSource)
     {
-        using var state = await StreamingHelpers.GetStreamingState(
+        // lidslabs: state disposal is managed manually (not `using`) because the transcoder-splash
+        // warm-start below transfers ownership of the state to the transcode job it launches.
+        var state = await StreamingHelpers.GetStreamingState(
                 streamingRequest,
                 HttpContext,
                 _mediaSourceManager,
@@ -1420,30 +1424,57 @@ public class DynamicHlsController : BaseJellyfinApiController
                 TranscodingJobType,
                 cancellationTokenSource.Token)
             .ConfigureAwait(false);
-        var mediaSourceId = state.BaseRequest.MediaSourceId;
-        double fps = state.TargetFramerate ?? 0.0f;
-
-        int segmentLength = state.SegmentLength * 1000;
-
-        // If video is transcoded and framerate is fractional (i.e. 23.976), we need to slightly adjust segment length
-        if (!EncodingHelper.IsCopyCodec(state.OutputVideoCodec) && Math.Abs(fps - Math.Floor(fps + 0.001f)) > 0.001)
+        var lidslabsStateOwnedByWarmStart = false;
+        try
         {
-            double nearestIntFramerate = Math.Ceiling(fps);
-            segmentLength = (int)Math.Ceiling(segmentLength * (nearestIntFramerate / fps));
+            var mediaSourceId = state.BaseRequest.MediaSourceId;
+            double fps = state.TargetFramerate ?? 0.0f;
+
+            int segmentLength = state.SegmentLength * 1000;
+
+            // If video is transcoded and framerate is fractional (i.e. 23.976), we need to slightly adjust segment length
+            if (!EncodingHelper.IsCopyCodec(state.OutputVideoCodec) && Math.Abs(fps - Math.Floor(fps + 0.001f)) > 0.001)
+            {
+                double nearestIntFramerate = Math.Ceiling(fps);
+                segmentLength = (int)Math.Ceiling(segmentLength * (nearestIntFramerate / fps));
+            }
+
+            var request = new CreateMainPlaylistRequest(
+                mediaSourceId is null ? null : Guid.Parse(mediaSourceId),
+                state.MediaPath,
+                segmentLength,
+                state.RunTimeTicks ?? 0,
+                state.Request.SegmentContainer ?? string.Empty,
+                "hls1/main/",
+                Request.QueryString.ToString(),
+                EncodingHelper.IsCopyCodec(state.OutputVideoCodec));
+            var playlist = _dynamicHlsPlaylistGenerator.CreateMainPlaylist(request);
+
+            // lidslabs: transcoder splash — prepend instantly-served splash segments so the viewer
+            // sees video immediately, and warm the real transcode so its startup ramp overlaps
+            // splash playback. Only for video sessions that actually transcode; strict no-op when
+            // LIDSLABS_TRANSCODE_SPLASH is unset.
+            if (LidslabsSplashSourcePath() is not null
+                && state.IsOutputVideo
+                && !EncodingHelper.IsCopyCodec(state.OutputVideoCodec))
+            {
+                var spliced = LidslabsTryApplySplash(playlist, state, Request.QueryString.ToString());
+                if (spliced is not null)
+                {
+                    playlist = spliced;
+                    lidslabsStateOwnedByWarmStart = LidslabsTryWarmTranscode(state);
+                }
+            }
+
+            return new FileContentResult(Encoding.UTF8.GetBytes(playlist), MimeTypes.GetMimeType("playlist.m3u8"));
         }
-
-        var request = new CreateMainPlaylistRequest(
-            mediaSourceId is null ? null : Guid.Parse(mediaSourceId),
-            state.MediaPath,
-            segmentLength,
-            state.RunTimeTicks ?? 0,
-            state.Request.SegmentContainer ?? string.Empty,
-            "hls1/main/",
-            Request.QueryString.ToString(),
-            EncodingHelper.IsCopyCodec(state.OutputVideoCodec));
-        var playlist = _dynamicHlsPlaylistGenerator.CreateMainPlaylist(request);
-
-        return new FileContentResult(Encoding.UTF8.GetBytes(playlist), MimeTypes.GetMimeType("playlist.m3u8"));
+        finally
+        {
+            if (!lidslabsStateOwnedByWarmStart)
+            {
+                state.Dispose();
+            }
+        }
     }
 
     private async Task<ActionResult> GetDynamicSegment(StreamingRequestDto streamingRequest, int segmentId)
@@ -1501,14 +1532,32 @@ public class DynamicHlsController : BaseJellyfinApiController
 
             if (segmentId == -1)
             {
-                _logger.LogDebug("Starting transcoding because fmp4 init file is being requested");
-                startTranscoding = true;
-                segmentId = 0;
+                // lidslabs: transcoder splash — a warm-started job for this exact playlist may still
+                // be ramping (no output files yet, so currentTranscodingIndex is null); adopt it
+                // instead of killing and restarting it. Inert when LIDSLABS_TRANSCODE_SPLASH is unset.
+                if (LidslabsHasActiveJob(playlistPath))
+                {
+                    _logger.LogDebug("lidslabs: adopting in-flight warm transcode for the fmp4 init request");
+                }
+                else
+                {
+                    _logger.LogDebug("Starting transcoding because fmp4 init file is being requested");
+                    startTranscoding = true;
+                    segmentId = 0;
+                }
             }
             else if (currentTranscodingIndex is null)
             {
-                _logger.LogDebug("Starting transcoding because currentTranscodingIndex=null");
-                startTranscoding = true;
+                // lidslabs: same adopt rule for the first media segment (see the init branch above).
+                if (segmentId == 0 && LidslabsHasActiveJob(playlistPath))
+                {
+                    _logger.LogDebug("lidslabs: adopting in-flight warm transcode for segment 0");
+                }
+                else
+                {
+                    _logger.LogDebug("Starting transcoding because currentTranscodingIndex=null");
+                    startTranscoding = true;
+                }
             }
             else if (segmentId < currentTranscodingIndex.Value)
             {
@@ -2151,5 +2200,503 @@ public class DynamicHlsController : BaseJellyfinApiController
         {
             _logger.LogError(ex, "Error deleting partial stream file(s) {Path}", path);
         }
+    }
+
+    // ====================================================================================
+    // lidslabs v0.4.0: transcoder splash
+    //
+    // When LIDSLABS_TRANSCODE_SPLASH points at an operator-provided video file, transcoded
+    // HLS video sessions get pre-encoded splash segments prepended to the variant playlist
+    // (separated from the real content by #EXT-X-DISCONTINUITY). The splash serves
+    // instantly from a per-profile rendition cache, masking the transcode-start ramp; the
+    // real transcode is warm-started in parallel so the ramp overlaps splash playback.
+    // Splash renditions match the session's output container, video codec, audio codec and
+    // dynamic range (libavformat-based players keep one decoder across a discontinuity, so
+    // codec parameters must not change at the seam). Every failure path falls through to
+    // the stock playlist: the splash must never block or break playback.
+    // ====================================================================================
+
+    private static readonly ConcurrentDictionary<string, byte> _lidslabsSplashGenerating = new();
+
+    /// <summary>
+    /// Gets a transcoder-splash segment (lidslabs). Active only when LIDSLABS_TRANSCODE_SPLASH is set.
+    /// </summary>
+    /// <param name="itemId">The item id (route-shape compatibility; the splash is global).</param>
+    /// <param name="segmentId">The segment id, or -1 for the fMP4 init segment.</param>
+    /// <param name="container">The segment container.</param>
+    /// <param name="lidslabsSplashKey">The splash rendition key.</param>
+    /// <response code="200">Splash segment returned.</response>
+    /// <response code="404">Splash disabled or segment not found.</response>
+    /// <returns>A <see cref="FileResult"/> containing the splash segment.</returns>
+    [HttpGet("Videos/{itemId}/hls1/splash/{segmentId}.{container}")]
+    [ProducesResponseType(StatusCodes.Status200OK)]
+    [ProducesResponseType(StatusCodes.Status404NotFound)]
+    [ProducesVideoFile]
+    [SuppressMessage("Microsoft.Performance", "CA1801:ReviewUnusedParameters", MessageId = "itemId", Justification = "Route-shape parity with hls1/main segment URLs")]
+    public ActionResult GetLidslabsSplashSegment(
+        [FromRoute, Required] Guid itemId,
+        [FromRoute, Required] int segmentId,
+        [FromRoute, Required] [RegularExpression(EncodingHelper.ContainerValidationRegexStr)] string container,
+        [FromQuery] string? lidslabsSplashKey)
+    {
+        if (LidslabsSplashSourcePath() is null
+            || string.IsNullOrEmpty(lidslabsSplashKey)
+            || !LidslabsIsValidSplashKey(lidslabsSplashKey))
+        {
+            return NotFound();
+        }
+
+        var fileName = segmentId == -1
+            ? "init.mp4"
+            : "s" + segmentId.ToString(CultureInfo.InvariantCulture) + "." + container;
+        var path = Path.Combine(LidslabsSplashCacheRoot(), lidslabsSplashKey, fileName);
+        if (!System.IO.File.Exists(path))
+        {
+            return NotFound();
+        }
+
+        return FileStreamResponseHelpers.GetStaticFileResult(path, MimeTypes.GetMimeType(path));
+    }
+
+    private static string? LidslabsSplashSourcePath()
+    {
+        var value = Environment.GetEnvironmentVariable("LIDSLABS_TRANSCODE_SPLASH");
+        return string.IsNullOrWhiteSpace(value) ? null : value;
+    }
+
+    private static bool LidslabsIsValidSplashKey(string key)
+    {
+        if (key.Length is 0 or > 64)
+        {
+            return false;
+        }
+
+        foreach (var c in key)
+        {
+            if (!char.IsAsciiLetterLower(c) && !char.IsAsciiDigit(c) && c != '-')
+            {
+                return false;
+            }
+        }
+
+        return true;
+    }
+
+    private static string? LidslabsNormalizeCodec(string? codec)
+    {
+        if (string.IsNullOrEmpty(codec))
+        {
+            return null;
+        }
+
+        return codec.ToLowerInvariant() switch
+        {
+            "h264" or "avc" => "h264",
+            "hevc" or "h265" => "hevc",
+            "aac" => "aac",
+            "ac3" or "ac-3" => "ac3",
+            "eac3" or "ec-3" => "eac3",
+            "mp3" => "mp3",
+            _ => null
+        };
+    }
+
+    private string LidslabsSplashCacheRoot()
+        => Path.Combine(_serverConfigurationManager.ApplicationPaths.CachePath, "lidslabs-splash");
+
+    private bool LidslabsHasActiveJob(string playlistPath)
+    {
+        if (LidslabsSplashSourcePath() is null)
+        {
+            return false;
+        }
+
+        var job = _transcodeManager.GetTranscodingJob(playlistPath, TranscodingJobType);
+        return job is not null && !job.HasExited;
+    }
+
+    /// <summary>
+    /// Returns the playlist with splash segments spliced in, or null when the splash cannot be
+    /// applied to this session (unsupported output profile, rendition not generated yet, or any
+    /// preparation failure). Never throws.
+    /// </summary>
+    private string? LidslabsTryApplySplash(string playlist, StreamState state, string queryString)
+    {
+        try
+        {
+            var sourcePath = LidslabsSplashSourcePath();
+            if (sourcePath is null)
+            {
+                return null;
+            }
+
+            if (!System.IO.File.Exists(sourcePath))
+            {
+                _logger.LogWarning("lidslabs: transcoder splash source not found at {Path}; skipping splash", sourcePath);
+                return null;
+            }
+
+            var videoCodec = LidslabsNormalizeCodec(state.ActualOutputVideoCodec);
+            var audioCodec = LidslabsNormalizeCodec(state.ActualOutputAudioCodec);
+            if (videoCodec is not ("h264" or "hevc") || audioCodec is not ("aac" or "ac3" or "eac3" or "mp3"))
+            {
+                _logger.LogDebug("lidslabs: no splash rendition profile for v={Video} a={Audio}", state.ActualOutputVideoCodec, state.ActualOutputAudioCodec);
+                return null;
+            }
+
+            // The HDR-passthrough gate only passes hevc/av1 outputs, so h264 is always sdr here.
+            var range = "sdr";
+            if (EncodingHelper.IsHdrPassthroughMode(state))
+            {
+                var sourceRange = state.VideoStream?.VideoRangeType ?? VideoRangeType.Unknown;
+                range = sourceRange is VideoRangeType.HLG or VideoRangeType.DOVIWithHLG ? "hlg" : "pq";
+            }
+
+            var containerName = EncodingHelper.GetSegmentFileExtension(state.Request.SegmentContainer).TrimStart('.');
+            if (containerName is not ("ts" or "mp4"))
+            {
+                return null;
+            }
+
+            var key = string.Create(
+                CultureInfo.InvariantCulture,
+                $"{videoCodec}-{audioCodec}-{range}-{containerName}-s{state.SegmentLength}");
+            var renditionDir = Path.Combine(LidslabsSplashCacheRoot(), key);
+            var renditionPlaylistPath = Path.Combine(renditionDir, "splash.m3u8");
+            var stampPath = Path.Combine(renditionDir, "source.stamp");
+            var sourceInfo = new FileInfo(sourcePath);
+            var stamp = string.Create(
+                CultureInfo.InvariantCulture,
+                $"{sourceInfo.Length}:{sourceInfo.LastWriteTimeUtc.Ticks}");
+
+            if (!System.IO.File.Exists(renditionPlaylistPath)
+                || !System.IO.File.Exists(stampPath)
+                || !string.Equals(System.IO.File.ReadAllText(stampPath), stamp, StringComparison.Ordinal))
+            {
+                // Not cached (or the operator swapped the splash file): generate in the background
+                // and let this session play without a splash; the next one picks it up.
+                LidslabsStartRenditionGeneration(key, renditionDir, sourcePath, stamp, videoCodec, audioCodec, range, containerName, state.SegmentLength);
+                return null;
+            }
+
+            return LidslabsSpliceSplash(playlist, renditionPlaylistPath, key, containerName, queryString);
+        }
+        catch (Exception ex)
+        {
+            _logger.LogWarning(ex, "lidslabs: transcoder splash preparation failed; serving the stock playlist");
+            return null;
+        }
+    }
+
+    private string? LidslabsSpliceSplash(string playlist, string renditionPlaylistPath, string key, string containerName, string queryString)
+    {
+        // Collect the rendition's segment durations (its files are named s0, s1, ... by construction).
+        var durations = new List<double>();
+        var lines = System.IO.File.ReadAllLines(renditionPlaylistPath);
+        foreach (var line in lines)
+        {
+            if (line.StartsWith("#EXTINF:", StringComparison.Ordinal))
+            {
+                var durationText = line["#EXTINF:".Length..].Split(',')[0];
+                if (double.TryParse(durationText, NumberStyles.Float, CultureInfo.InvariantCulture, out var duration))
+                {
+                    durations.Add(duration);
+                }
+            }
+        }
+
+        if (durations.Count == 0)
+        {
+            return null;
+        }
+
+        var anchor = playlist.IndexOf("#EXT-X-MEDIA-SEQUENCE", StringComparison.Ordinal);
+        if (anchor < 0)
+        {
+            return null;
+        }
+
+        var insertAt = playlist.IndexOf('\n', anchor);
+        if (insertAt < 0)
+        {
+            return null;
+        }
+
+        insertAt++;
+
+        // The content #EXT-X-MAP (fmp4) sits directly after #EXT-X-MEDIA-SEQUENCE, so inserting the
+        // splash block at this point yields: splash map, splash segments, discontinuity, content map,
+        // content segments — which is exactly the required ordering.
+        var uriSuffix = (queryString.Length == 0 ? "?" : queryString + "&") + "lidslabsSplashKey=" + key;
+        var builder = new StringBuilder(1024);
+        if (string.Equals(containerName, "mp4", StringComparison.OrdinalIgnoreCase))
+        {
+            builder.Append("#EXT-X-MAP:URI=\"hls1/splash/-1.mp4")
+                .Append(uriSuffix)
+                .Append('"')
+                .AppendLine();
+        }
+
+        var index = 0;
+        foreach (var duration in durations)
+        {
+            builder.Append("#EXTINF:")
+                .Append(duration.ToString("0.000000", CultureInfo.InvariantCulture))
+                .AppendLine(", nodesc")
+                .Append("hls1/splash/")
+                .Append(index++)
+                .Append('.')
+                .Append(containerName)
+                .AppendLine(uriSuffix);
+        }
+
+        builder.AppendLine("#EXT-X-DISCONTINUITY");
+
+        var spliced = playlist.Insert(insertAt, builder.ToString());
+
+        // Bump TARGETDURATION if a splash segment exceeds the content's.
+        const string TargetDurationTag = "#EXT-X-TARGETDURATION:";
+        var splashMax = (int)Math.Ceiling(durations.Max());
+        var tagStart = spliced.IndexOf(TargetDurationTag, StringComparison.Ordinal);
+        if (tagStart >= 0)
+        {
+            var valueStart = tagStart + TargetDurationTag.Length;
+            var valueEnd = spliced.IndexOf('\n', valueStart);
+            if (valueEnd > valueStart)
+            {
+                var valueText = spliced[valueStart..valueEnd].TrimEnd('\r');
+                if (int.TryParse(valueText, NumberStyles.Integer, CultureInfo.InvariantCulture, out var current) && splashMax > current)
+                {
+                    spliced = spliced.Remove(valueStart, valueText.Length)
+                        .Insert(valueStart, splashMax.ToString(CultureInfo.InvariantCulture));
+                }
+            }
+        }
+
+        _logger.LogInformation("lidslabs: transcoder splash applied (key={Key}, segments={Count})", key, durations.Count);
+        return spliced;
+    }
+
+    /// <summary>
+    /// Fire-and-forget warm start of the real transcode so its startup ramp runs while the client
+    /// plays the splash. On success the transcode job owns the state; returns true when ownership
+    /// of the state has been transferred to the background task (in every case), false when the
+    /// caller must dispose the state itself.
+    /// </summary>
+    private bool LidslabsTryWarmTranscode(StreamState state)
+    {
+        try
+        {
+            var playlistPath = Path.ChangeExtension(state.OutputFilePath, ".m3u8");
+            var commandLineArguments = GetCommandLineArguments(playlistPath, state, false, 0);
+            var userId = Request.HttpContext.User.GetUserId();
+            var deviceId = state.Request.DeviceId;
+            var playSessionId = state.Request.PlaySessionId;
+
+            _ = Task.Run(async () =>
+            {
+                var ownsState = true;
+                try
+                {
+                    using (await _transcodeManager.LockAsync(playlistPath, CancellationToken.None).ConfigureAwait(false))
+                    {
+                        var existing = _transcodeManager.GetTranscodingJob(playlistPath, TranscodingJobType);
+                        if (existing is not null && !existing.HasExited)
+                        {
+                            // A segment request beat us to it; that job already owns its own state.
+                            return;
+                        }
+
+                        if (!string.IsNullOrEmpty(deviceId))
+                        {
+                            await _transcodeManager.KillTranscodingJobs(deviceId, playSessionId, _ => false).ConfigureAwait(false);
+                        }
+
+                        // Wait for segment 0 like the stock start path does — NOT for ffmpeg's own
+                        // playlist file: with -hls_playlist_type vod ffmpeg only writes that at
+                        // finalize, which would hold this lock for the entire transcode.
+                        state.WaitForPath = GetSegmentPath(state, playlistPath, 0);
+                        await _transcodeManager.StartFfMpeg(
+                            state,
+                            playlistPath,
+                            commandLineArguments,
+                            userId,
+                            TranscodingJobType,
+                            new CancellationTokenSource()).ConfigureAwait(false);
+                        ownsState = false;
+                        _logger.LogInformation("lidslabs: warm transcode started for {PlaylistPath}", playlistPath);
+
+                        // Arm the idle kill-timer (begin+end leaves ActiveRequestCount at 0): if no
+                        // client ever claims this warm job, it dies in the stock HLS idle window
+                        // instead of transcoding the whole file for nobody.
+                        var warmJob = _transcodeManager.OnTranscodeBeginRequest(playlistPath, TranscodingJobType);
+                        if (warmJob is not null)
+                        {
+                            _transcodeManager.OnTranscodeEndRequest(warmJob);
+                        }
+                    }
+                }
+                catch (Exception ex)
+                {
+                    _logger.LogWarning(ex, "lidslabs: warm transcode failed to start; playback will start it lazily");
+                }
+                finally
+                {
+                    if (ownsState)
+                    {
+                        state.Dispose();
+                    }
+                }
+            });
+
+            return true;
+        }
+        catch (Exception ex)
+        {
+            _logger.LogWarning(ex, "lidslabs: warm transcode setup failed; playback will start it lazily");
+            return false;
+        }
+    }
+
+    private void LidslabsStartRenditionGeneration(string key, string renditionDir, string sourcePath, string stamp, string videoCodec, string audioCodec, string range, string containerName, int segmentLength)
+    {
+        if (!_lidslabsSplashGenerating.TryAdd(key, 0))
+        {
+            return;
+        }
+
+        var encoderPath = _mediaEncoder.EncoderPath;
+        _ = Task.Run(async () =>
+        {
+            var tempDir = renditionDir + ".tmp";
+            try
+            {
+                if (Directory.Exists(tempDir))
+                {
+                    Directory.Delete(tempDir, true);
+                }
+
+                Directory.CreateDirectory(tempDir);
+                var arguments = LidslabsBuildRenditionArguments(sourcePath, tempDir, videoCodec, audioCodec, range, containerName, segmentLength);
+                _logger.LogInformation("lidslabs: generating splash rendition {Key}: {Encoder} {Arguments}", key, encoderPath, arguments);
+
+                using var process = new Process
+                {
+                    StartInfo = new ProcessStartInfo
+                    {
+                        FileName = encoderPath,
+                        Arguments = arguments,
+                        UseShellExecute = false,
+                        RedirectStandardOutput = true,
+                        RedirectStandardError = true,
+                        CreateNoWindow = true
+                    }
+                };
+                process.Start();
+                var standardError = process.StandardError.ReadToEndAsync();
+                _ = process.StandardOutput.ReadToEndAsync();
+                using var timeout = new CancellationTokenSource(TimeSpan.FromMinutes(3));
+                try
+                {
+                    await process.WaitForExitAsync(timeout.Token).ConfigureAwait(false);
+                }
+                catch (OperationCanceledException)
+                {
+                    try
+                    {
+                        process.Kill(true);
+                    }
+                    catch (InvalidOperationException)
+                    {
+                    }
+
+                    _logger.LogWarning("lidslabs: splash rendition {Key} generation timed out", key);
+                    return;
+                }
+
+                if (process.ExitCode != 0)
+                {
+                    var errorText = await standardError.ConfigureAwait(false);
+                    _logger.LogWarning(
+                        "lidslabs: splash rendition {Key} generation failed (exit {Code}): {Error}",
+                        key,
+                        process.ExitCode,
+                        errorText.Length > 500 ? errorText[^500..] : errorText);
+                    return;
+                }
+
+                await System.IO.File.WriteAllTextAsync(Path.Combine(tempDir, "source.stamp"), stamp).ConfigureAwait(false);
+                if (Directory.Exists(renditionDir))
+                {
+                    Directory.Delete(renditionDir, true);
+                }
+
+                Directory.Move(tempDir, renditionDir);
+                _logger.LogInformation("lidslabs: splash rendition {Key} ready", key);
+            }
+            catch (Exception ex)
+            {
+                _logger.LogWarning(ex, "lidslabs: splash rendition {Key} generation failed", key);
+            }
+            finally
+            {
+                try
+                {
+                    if (Directory.Exists(tempDir))
+                    {
+                        Directory.Delete(tempDir, true);
+                    }
+                }
+                catch (IOException)
+                {
+                }
+
+                _lidslabsSplashGenerating.TryRemove(key, out _);
+            }
+        });
+    }
+
+    private static string LidslabsBuildRenditionArguments(string sourcePath, string outputDir, string videoCodec, string audioCodec, string range, string containerName, int segmentLength)
+    {
+        // 1080p letterboxed canvas; splash resolution/framerate need not match the content
+        // (the discontinuity covers that), but codec family and dynamic range must.
+        var filters = "scale=1920:1080:force_original_aspect_ratio=decrease:force_divisible_by=2,pad=1920:1080:(ow-iw)/2:(oh-ih)/2";
+        string videoArguments;
+        if (string.Equals(videoCodec, "h264", StringComparison.Ordinal))
+        {
+            filters += ",format=yuv420p";
+            videoArguments = "-c:v libx264 -preset veryfast -b:v 6000k -maxrate 7000k -bufsize 12000k -profile:v high -sc_threshold 0";
+        }
+        else
+        {
+            videoArguments = "-c:v libx265 -preset veryfast -b:v 6000k -x265-params scenecut=0:log-level=error";
+            if (string.Equals(containerName, "mp4", StringComparison.Ordinal))
+            {
+                videoArguments += " -tag:v hvc1";
+            }
+
+            if (string.Equals(range, "sdr", StringComparison.Ordinal))
+            {
+                filters += ",format=yuv420p";
+            }
+            else
+            {
+                // Map the (SDR) splash into the HDR range the session delivers, so the seam
+                // does not switch dynamic range. One zscale call with explicit input tags —
+                // zimg linearizes internally; a multi-step linear/RGB chain fails with
+                // "no path between colorspaces". SDR reference white lands at 203 nits.
+                var transfer = string.Equals(range, "hlg", StringComparison.Ordinal) ? "arib-std-b67" : "smpte2084";
+                filters += ",zscale=tin=bt709:pin=bt709:min=bt709:rin=tv:t=" + transfer + ":p=bt2020:m=bt2020nc:r=tv:npl=203,format=yuv420p10le";
+                videoArguments += " -color_primaries bt2020 -color_trc " + transfer + " -colorspace bt2020nc";
+            }
+        }
+
+        var segmentType = string.Equals(containerName, "mp4", StringComparison.Ordinal)
+            ? "fmp4 -hls_fmp4_init_filename init.mp4"
+            : "mpegts";
+
+        return string.Create(
+            CultureInfo.InvariantCulture,
+            $"-hide_banner -loglevel error -nostdin -y -i \"{sourcePath}\" -t 30 -map 0:v:0 -map 0:a:0 -vf \"{filters}\" {videoArguments} -force_key_frames:v \"expr:gte(t,n_forced*{segmentLength})\" -c:a {audioCodec} -b:a 192k -ac 2 -ar 48000 -f hls -hls_time {segmentLength} -hls_playlist_type vod -hls_list_size 0 -hls_segment_type {segmentType} -hls_segment_filename \"{outputDir}/s%d.{containerName}\" \"{outputDir}/splash.m3u8\"");
     }
 }
