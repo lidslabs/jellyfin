@@ -2353,8 +2353,13 @@ public class DynamicHlsController : BaseJellyfinApiController
             }
 
             var containerName = EncodingHelper.GetSegmentFileExtension(state.Request.SegmentContainer).TrimStart('.');
-            if (containerName is not ("ts" or "mp4"))
+
+            // ts-only: fMP4 players can't be trusted across the init-segment switch at the
+            // discontinuity (AVPlayer stalls at the seam; mpv keeps the splash init and
+            // garbles the content video). Device matrix 2026-07-10.
+            if (containerName is not "ts")
             {
+                _logger.LogDebug("lidslabs: splash skipped for segment container {Container} (ts-only)", containerName);
                 return null;
             }
 
