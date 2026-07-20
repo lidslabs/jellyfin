@@ -199,8 +199,19 @@ public class MediaInfoController : BaseJellyfinApiController
         //
         // Targeting is by AUTHENTICATED CLIENT APP NAME via User.GetClient(), not
         // DeviceProfile.Name: Swiftfin posts Name=null, so the forced-HEVC
-        // profile.Name map cannot see it. User.GetClient() == "Jellyfin tvOS" is
-        // Swiftfin's stable, unique identity (Swiftfin is the Jellyfin tvOS app).
+        // profile.Name map cannot see it. User.GetClient() == "Swiftfin tvOS" is
+        // Swiftfin's stable, unique identity — the same claim SessionManager logs
+        // as "reported by app".
+        //
+        // 2026-07-20 REGRESSION FIX: the Swiftfin tvOS full release (first seen as
+        // v1.5) renamed this client string from "Jellyfin tvOS" to "Swiftfin tvOS".
+        // The old gate silently evaluated false, disabling ALL THREE Swiftfin
+        // corrections below (TrueHD strip, DV Profile 7 strip, fMP4 HLS force) from
+        // the moment the app auto-updated. Match the new string exactly; the old
+        // string is dropped deliberately — the App Store auto-updates every Swiftfin
+        // install, so no "Jellyfin tvOS"-era client remains in the fleet. See
+        // DEBUG_LOG.md 2026-07-20.
+        //
         // Always-on / code-scoped: correcting a falsely-advertised capability is a
         // fix, not an operator preference (mirrors the always-on AC3 redirect).
         // Single Swiftfin-client gate, shared by the TrueHD audio strip and the
@@ -208,7 +219,7 @@ public class MediaInfoController : BaseJellyfinApiController
         // over-claimed capabilities).
         var lidslabsSwiftfinClient =
             profile is not null
-            && string.Equals(User.GetClient(), "Jellyfin tvOS", StringComparison.OrdinalIgnoreCase);
+            && string.Equals(User.GetClient(), "Swiftfin tvOS", StringComparison.OrdinalIgnoreCase);
 
         // Gate-decision diagnostic (Debug; dormant at Information level, like the
         // forced-HEVC gate above). Raise the level to Debug to confirm "is this
