@@ -149,81 +149,78 @@ public class MediaInfoController : BaseJellyfinApiController
             }
         }
 
-        // lidslabs v0.3.2: forced-HEVC override — source-independent and gated on
-        // its OWN enable. This is a codec *preference* lever, not part of HDR
-        // enablement: it fires whenever a client in LIDSLABS_FORCE_HEVC_CLIENTS
-        // advertises HEVC, for ANY source (SDR or HDR). It is deliberately NOT
-        // gated on LIDSLABS_ALLOW_HDR_TRANSCODE — forcing HEVC on an SDR remux
-        // (the original FORCE_HEVC intent) has nothing to do with the HDR master
-        // toggle. Keeping the two independent means the base HDR-passthrough
-        // feature (governed solely by LIDSLABS_ALLOW_HDR_TRANSCODE inside
-        // IsHdrPassthroughMode) always fires on its own terms, and this lever can
-        // never enable or disable it. The safeguard is unchanged: the override
-        // never invents capability — LidslabsProfileClaimsHevc still requires the
-        // client to advertise HEVC. Computed here (profile is resolved); the
-        // TranscodingProfile rewrite happens below, once info.MediaSources exists.
+        // lidslabs: Swiftfin (Apple TV, client "Swiftfin tvOS") gate. Swiftfin's
+        // full release (v1.5, 2026-07) ships two player engines — "Swiftfin"
+        // (VLCKit) and "Native" (Apple AVPlayer) — that post DISTINCT
+        // DeviceProfiles but authenticate under the SAME client string and both
+        // post DeviceProfile.Name=null. The authenticated client app name via
+        // User.GetClient() — the same value SessionManager logs as "reported by
+        // app" — is therefore the ONLY stable, collision-free handle on "this is
+        // Swiftfin (either engine)"; the Name-keyed LidslabsClientMatches map
+        // cannot see Swiftfin at all (Name is null).
+        //
+        // 2026-07-20/21 REGRESSION + RETUNE. v1.5 (a) renamed the client string
+        // "Jellyfin tvOS" -> "Swiftfin tvOS" (the old gate silently went false,
+        // disabling every Swiftfin correction the moment the app auto-updated),
+        // and (b) rewrote both profiles so two former over-claims are GONE:
+        // neither engine advertises truehd in audio direct-play anymore (a TrueHD
+        // source natively selects+copies its AC3 compat track), and both default
+        // their HLS transcode container to mp4/fMP4. The old TrueHD-strip and
+        // fMP4-force corrections are dead against v1.5 and have been REMOVED. Two
+        // over-claims remain and are corrected below: the DV Profile 7 direct-play
+        // claim (EL strip) and the H264-default transcode that flattens HDR to SDR
+        // (force-HEVC). Match the new string exactly; the old string is dropped
+        // (the App Store auto-updates every install). See DEBUG_LOG.md 2026-07-21.
+        var lidslabsSwiftfinClient =
+            profile is not null
+            && string.Equals(User.GetClient(), "Swiftfin tvOS", StringComparison.OrdinalIgnoreCase);
+
+        // lidslabs v0.3.2: forced-HEVC override — source-independent codec
+        // *preference* lever, not part of HDR enablement: it fires whenever an
+        // eligible client advertises HEVC, for ANY source (SDR or HDR). It is
+        // deliberately NOT gated on LIDSLABS_ALLOW_HDR_TRANSCODE — forcing HEVC on
+        // an SDR remux has nothing to do with the HDR master toggle. Keeping the
+        // two independent means the base HDR-passthrough feature (governed solely
+        // by LIDSLABS_ALLOW_HDR_TRANSCODE inside IsHdrPassthroughMode) always fires
+        // on its own terms, and this lever can never enable or disable it. The
+        // safeguard is unchanged: the override never invents capability —
+        // LidslabsProfileClaimsHevc still requires the client to advertise HEVC.
+        //
+        // 2026-07-21: Swiftfin is force-HEVC too, reached via the client gate
+        // above rather than the LIDSLABS_FORCE_HEVC_CLIENTS name-map (Swiftfin
+        // posts Name=null, so the map can never match it). Without this, Swiftfin's
+        // profile lists h264 ahead of hevc and Jellyfin transcodes an HDR HEVC
+        // source to h264 — which cannot carry HDR10, so the picture is tonemapped
+        // to SDR (observed on both engines, DEBUG_LOG 2026-07-21). Forcing HEVC
+        // keeps the HDR-passthrough path engaged so HDR survives the transcode.
+        // Computed here (profile is resolved); the TranscodingProfile rewrite
+        // happens below, once info.MediaSources exists.
         var lidslabsForceHevcEligible =
             profile is not null
-            && LidslabsClientMatches(
-                profile.Name,
-                Environment.GetEnvironmentVariable("LIDSLABS_FORCE_HEVC_CLIENTS"))
-            && LidslabsProfileClaimsHevc(profile);
+            && LidslabsProfileClaimsHevc(profile)
+            && (LidslabsClientMatches(
+                    profile.Name,
+                    Environment.GetEnvironmentVariable("LIDSLABS_FORCE_HEVC_CLIENTS"))
+                || lidslabsSwiftfinClient);
 
         // lidslabs v0.3: gate-decision diagnostic log. Logs at Debug, so it is
         // silent in a default (Information-level) build and emits nothing in
         // production. Raise the log level to Debug to diagnose a "the override
         // doesn't fire for client X" report in a single cycle — it dumps the
-        // gate inputs (profile name, configured client list, HEVC capability)
-        // and the eligibility result, distinguishing "patch absent from build"
-        // from "a gate failed". (The HDR master toggle is intentionally NOT a
-        // gate input here — see the eligibility note above.) See DECISIONS.md,
+        // gate inputs (profile name, configured client list, HEVC capability, the
+        // Swiftfin client gate) and the eligibility result. See DECISIONS.md,
         // "Diagnostic logging at the eligibility point".
         _logger.LogDebug(
-            "lidslabs.forceHevc gate: profile={ProfileName}, clients={Clients}, profileHevc={ProfileHevc}, eligible={Eligible}",
+            "lidslabs.forceHevc gate: profile={ProfileName}, clients={Clients}, profileHevc={ProfileHevc}, swiftfin={Swiftfin}, eligible={Eligible}",
             profile?.Name,
             Environment.GetEnvironmentVariable("LIDSLABS_FORCE_HEVC_CLIENTS"),
             profile is not null && LidslabsProfileClaimsHevc(profile),
+            lidslabsSwiftfinClient,
             lidslabsForceHevcEligible);
 
-        // lidslabs v0.3.2: Swiftfin (Apple TV) direct-play no-audio fix. Swiftfin's
-        // posted DeviceProfile over-claims lossless direct-play — its audio
-        // DirectPlayProfiles list truehd with NO restricting audio CodecProfile —
-        // but Apple AVPlayer cannot decode TrueHD, so the client direct-plays the
-        // stream and renders SILENCE (worse than a transcode fallback). The strip
-        // below removes the TrueHD family from the audio direct-play list, forcing
-        // audio to transcode: the existing AC3 sidecar redirect then fires when an
-        // AC3 track exists, otherwise Jellyfin transcodes the source audio. Either
-        // way the user gets audio. (DTS-HD MA is deliberately NOT stripped — the
-        // 2026-06-30 capture showed Swiftfin decodes its DTS core and plays fine, so
-        // that direct-play claim is not false. See DEBUG_LOG.md 2026-06-30.)
-        //
-        // Targeting is by AUTHENTICATED CLIENT APP NAME via User.GetClient(), not
-        // DeviceProfile.Name: Swiftfin posts Name=null, so the forced-HEVC
-        // profile.Name map cannot see it. User.GetClient() == "Swiftfin tvOS" is
-        // Swiftfin's stable, unique identity — the same claim SessionManager logs
-        // as "reported by app".
-        //
-        // 2026-07-20 REGRESSION FIX: the Swiftfin tvOS full release (first seen as
-        // v1.5) renamed this client string from "Jellyfin tvOS" to "Swiftfin tvOS".
-        // The old gate silently evaluated false, disabling ALL THREE Swiftfin
-        // corrections below (TrueHD strip, DV Profile 7 strip, fMP4 HLS force) from
-        // the moment the app auto-updated. Match the new string exactly; the old
-        // string is dropped deliberately — the App Store auto-updates every Swiftfin
-        // install, so no "Jellyfin tvOS"-era client remains in the fleet. See
-        // DEBUG_LOG.md 2026-07-20.
-        //
-        // Always-on / code-scoped: correcting a falsely-advertised capability is a
-        // fix, not an operator preference (mirrors the always-on AC3 redirect).
-        // Single Swiftfin-client gate, shared by the TrueHD audio strip and the
-        // DV Profile 7 video strip below (both correct the same client's
-        // over-claimed capabilities).
-        var lidslabsSwiftfinClient =
-            profile is not null
-            && string.Equals(User.GetClient(), "Swiftfin tvOS", StringComparison.OrdinalIgnoreCase);
-
-        // Gate-decision diagnostic (Debug; dormant at Information level, like the
-        // forced-HEVC gate above). Raise the level to Debug to confirm "is this
-        // request seen as Swiftfin?" in one cycle.
+        // Swiftfin gate diagnostic (Debug; dormant at Information level). Raise the
+        // level to Debug to confirm "is this request seen as Swiftfin?" in one
+        // cycle.
         _logger.LogDebug(
             "lidslabs.swiftfin gate: client={Client}, eligible={Eligible}",
             User.GetClient(),
@@ -404,77 +401,63 @@ public class MediaInfoController : BaseJellyfinApiController
                 }
             }
 
-            // lidslabs v0.3.2: strip the TrueHD family (truehd/mlp) from Swiftfin's
-            // audio direct-play profiles so a TrueHD track cannot direct-play to
-            // silence. Mutates the shared profile once, pre-loop (kept out of the
-            // per-MediaSource loop below — a noted regression risk). Video
-            // DirectPlayProfiles only; VideoCodec and Container are untouched, so
-            // video still direct-plays/direct-streams and only audio falls to
-            // transcode. Inert unless a source actually carries a TrueHD track.
-            // (mlp is the TrueHD-family alias used by EncodingHelper's AC3 redirect;
-            // it is not in Swiftfin's advertised list today, so stripping it is a
-            // harmless no-op there, kept for consistency.)
+            // lidslabs: Swiftfin over-claims Dolby Vision Profile 7 (dual-layer:
+            // VideoRangeType DOVIWithEL / DOVIWithELHDR10Plus) direct-play. Neither
+            // engine can render the enhancement layer: VLCKit software-decodes it
+            // but never drives the TV's HDR handshake, and AVPlayer (tvOS supports
+            // DV P5/P8 only, never P7) either shows the HDR10 base by luck or
+            // hard-fails. v1.5's profiles now DECLARE a hevc VideoRangeType
+            // allow-list — but it still INCLUDES DOVIWithELHDR10Plus on BOTH
+            // engines, so the raw dual-layer stream is handed through (capture
+            // 2026-07-21). The pre-v1.5 strip injected an EL-free allow-list only
+            // when NO restriction existed and skipped when one did — exactly the
+            // wrong branch now that v1.5 declares a permissive one.
+            //
+            // Remove the EL/dual-layer range tokens from every hevc VideoRangeType
+            // condition the profile declares. A P7 source then fails the hevc
+            // CodecProfile, so StreamBuilder.CanStreamCopyVideo copies the video
+            // with the upstream RemoveDovi bitstream filter (dovi_rpu=strip) and
+            // delivers the clean HDR10 base — HDR engages, NO re-encode. Single-
+            // layer DV P5/P8 (DOVI, DOVIWithHDR10/HLG/SDR) and HDR10/HLG/SDR carry
+            // no EL, stay in the list, and keep direct-playing. Unified across both
+            // engines (Name is null, so we cannot and need not branch by engine).
+            // Fallback: if the profile declares NO hevc VideoRangeType condition at
+            // all, append an explicit EL-free allow-list (the pre-v1.5 behavior),
+            // so the correction still holds if a future build drops its declaration.
+            // VideoRangeType values are '|'-delimited (not comma), so they are split
+            // directly here rather than via the comma-based LidslabsSplitTrim.
             if (lidslabsSwiftfinClient)
             {
-                var strippedAny = false;
-                foreach (var dp in profile.DirectPlayProfiles.Where(p => p.Type == DlnaProfileType.Video))
-                {
-                    if (string.IsNullOrEmpty(dp.AudioCodec))
-                    {
-                        continue;
-                    }
+                var elRanges = new[] { "DOVIWithEL", "DOVIWithELHDR10Plus" };
 
-                    var original = LidslabsSplitTrim(dp.AudioCodec);
-                    var kept = original
-                        .Where(c => !string.Equals(c, "truehd", StringComparison.OrdinalIgnoreCase)
-                                    && !string.Equals(c, "mlp", StringComparison.OrdinalIgnoreCase))
-                        .ToArray();
-
-                    if (kept.Length != original.Length)
-                    {
-                        dp.AudioCodec = string.Join(",", kept);
-                        strippedAny = true;
-                    }
-                }
-
-                if (strippedAny)
-                {
-                    _logger.LogInformation(
-                        "lidslabs: Swiftfin TrueHD audio strip fired for client={Client}, item={ItemId}",
-                        User.GetClient(),
-                        itemId);
-                }
-            }
-
-            // lidslabs v0.3.2: Swiftfin over-claims Dolby Vision Profile 7
-            // (dual-layer: VideoRangeType DOVIWithEL / DOVIWithELHDR10Plus)
-            // direct-play. Its posted profile carries NO VideoRangeType restriction
-            // at all (capture 2026-06-30), so Jellyfin hands the Apple TV the raw
-            // dual-layer stream — AVPlayer cannot render P7, so HDR never engages,
-            // and once audio also leaves direct-play the dual-layer remux corrupts
-            // the picture. Inject the VideoRangeType condition Swiftfin should have
-            // declared: an EqualsAny allow-list of every range the Apple TV DOES
-            // handle (HDR10/HLG/SDR + single-layer DV P5/P8), excluding only the P7
-            // EL types. A P7 source then fails this HEVC CodecProfile condition, so
-            // StreamBuilder.CanStreamCopyVideo copies the video with the upstream
-            // RemoveDovi bitstream filter (dovi_rpu=strip) and delivers the clean
-            // HDR10 base — HDR engages, NO re-encode. P5/P8/HDR10 stay direct-play.
-            // Added as a dedicated CodecProfile (empty ApplyConditions => always
-            // applies to hevc) so Swiftfin's existing entries are left untouched.
-            // Idempotent: skipped if a VideoRangeType restriction already exists.
-            if (lidslabsSwiftfinClient)
-            {
-                const string lidslabsAppleTvRangeTypes =
-                    "SDR|HDR10|HLG|DOVI|DOVIWithHDR10|DOVIWithHLG|DOVIWithSDR|DOVIWithHDR10Plus|HDR10Plus";
-
-                var alreadyRestricted = profile.CodecProfiles
+                var hevcRangeConditions = profile.CodecProfiles
                     .Where(cp => cp.Type == CodecType.Video
                                  && LidslabsSplitTrim(cp.Codec).Contains("hevc", StringComparer.OrdinalIgnoreCase))
-                    .Any(cp => cp.Conditions.Any(c => c.Property == ProfileConditionValue.VideoRangeType));
+                    .SelectMany(cp => cp.Conditions)
+                    .Where(c => c.Property == ProfileConditionValue.VideoRangeType)
+                    .ToArray();
 
-                if (!alreadyRestricted)
+                var correctedEl = false;
+                foreach (var cond in hevcRangeConditions)
                 {
-                    var elStrip = new CodecProfile
+                    var ranges = cond.Value.Split('|', StringSplitOptions.RemoveEmptyEntries | StringSplitOptions.TrimEntries);
+                    var kept = ranges
+                        .Where(r => !elRanges.Contains(r, StringComparer.OrdinalIgnoreCase))
+                        .ToArray();
+
+                    if (kept.Length != ranges.Length)
+                    {
+                        cond.Value = string.Join("|", kept);
+                        correctedEl = true;
+                    }
+                }
+
+                if (hevcRangeConditions.Length == 0)
+                {
+                    const string lidslabsAppleTvRangeTypes =
+                        "SDR|HDR10|HLG|DOVI|DOVIWithHDR10|DOVIWithHLG|DOVIWithSDR|DOVIWithHDR10Plus|HDR10Plus";
+
+                    profile.CodecProfiles = profile.CodecProfiles.Append(new CodecProfile
                     {
                         Type = CodecType.Video,
                         Codec = "hevc",
@@ -486,42 +469,17 @@ public class MediaInfoController : BaseJellyfinApiController
                                 lidslabsAppleTvRangeTypes,
                                 false),
                         },
-                    };
+                    }).ToArray();
+                    correctedEl = true;
+                }
 
-                    profile.CodecProfiles = profile.CodecProfiles.Append(elStrip).ToArray();
-
+                if (correctedEl)
+                {
                     _logger.LogInformation(
-                        "lidslabs: Swiftfin DV Profile 7 strip applied (injected HEVC VideoRangeType allow-list) for client={Client}, item={ItemId}",
+                        "lidslabs: Swiftfin DV Profile 7 strip applied (removed EL ranges from hevc VideoRangeType) for client={Client}, item={ItemId}",
                         User.GetClient(),
                         itemId);
                 }
-            }
-
-            // lidslabs v0.3.2: force Swiftfin's HLS remux/transcode to fMP4
-            // (CMAF) segments instead of MPEG-TS. Apple's AVPlayer — Swiftfin's
-            // renderer on Apple TV — cannot decode HEVC inside an MPEG-TS
-            // container and renders digital static; on Apple platforms HEVC over
-            // HLS must use fMP4. The TrueHD and DV P7 strips above push a
-            // lossless/dual-layer title off pure direct-play into a remux, and
-            // Jellyfin's default HLS segment container is MPEG-TS, so without
-            // this the remux would be HEVC-in-mpegts = static. Rewriting the
-            // video HLS TranscodingProfile container ts->mp4 makes StreamInfo
-            // emit &SegmentContainer=mp4, which DynamicHlsController muxes as
-            // fMP4 — the same effect as Swiftfin's "fMP4 HLS" app setting, but
-            // automatic. Container-only: codecs/protocol/conditions are
-            // untouched, so the copy-vs-transcode decision is unchanged; only the
-            // segment muxing format differs. fMP4 is the Apple-native HLS path,
-            // safe for h264/HEVC and SDR/HDR alike. This is the general rule
-            // "force fMP4 whenever an Apple-TV AVPlayer client transcodes HEVC"
-            // applied to Swiftfin; Neptune AV Player is a documented future
-            // adopter (its forced-HEVC "cannot render HLS HEVC" failure is
-            // suspected to be this same mpegts bug — see .project docs).
-            if (lidslabsSwiftfinClient && LidslabsForceFmp4Hls(profile))
-            {
-                _logger.LogInformation(
-                    "lidslabs: Swiftfin fMP4 HLS force applied (video TranscodingProfile container -> mp4) for client={Client}, item={ItemId}",
-                    User.GetClient(),
-                    itemId);
             }
 
             // set device specific data
