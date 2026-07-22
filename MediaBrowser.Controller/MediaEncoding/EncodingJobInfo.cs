@@ -72,6 +72,22 @@ namespace MediaBrowser.Controller.MediaEncoding
 
         public string MediaPath { get; set; }
 
+        // lidslabs v0.4.0 (NVEncC engine): the authenticated client app name
+        // (httpContext.User.GetClient(), e.g. "Moonfin"). Set at stream setup in
+        // StreamingHelpers.GetStreamingState so the encoding layer — which cannot
+        // reference the Jellyfin.Api ClaimsPrincipal extension — can gate on the
+        // client for the DV-render-capable allow-list. Null when unauthenticated.
+        public string LidslabsClientName { get; set; }
+
+        // lidslabs v0.4.0 (NVEncC engine): the fully-built nvencc sidecar command
+        // and the FIFO path it writes to, populated by the command builder when the
+        // NVEncC engine is active for this job. TranscodeManager reads these to
+        // mkfifo, spawn the sidecar, and tie its lifecycle to the transcoding job.
+        // Both null (the default) = stock ffmpeg-only path, fail-open.
+        public string LidslabsNvenccCommand { get; set; }
+
+        public string LidslabsNvenccFifoPath { get; set; }
+
         public bool IsInputVideo { get; set; }
 
         public string OutputAudioCodec { get; set; }

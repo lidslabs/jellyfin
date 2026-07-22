@@ -6517,6 +6517,179 @@ namespace MediaBrowser.Controller.MediaEncoding
                 || string.Equals(envFlag, "true", StringComparison.OrdinalIgnoreCase);
         }
 
+        // ====================================================================
+        // NVEncC transcode engine (lidslabs v0.4.0)
+        // ====================================================================
+        // The muted-Dolby-Vision fix. DV Profile 7 titles graded at a high
+        // mastering-display peak look washed out on mpv-based clients (Moonfin,
+        // Streamyfin) because those clients tone-map against the 4000-nit *label*
+        // rather than the true content, and no non-DV client applies the RPU.
+        // Stock jellyfin-ffmpeg cannot preserve the DV RPU through a transcode.
+        // rigaya NVEncC can: it converts DV P7 -> P8.1 on the fly
+        // (--dolby-vision-profile 8.1 --dolby-vision-rpu copy), keeping the dynamic
+        // per-scene RPU in-band so mpv renders the real levels. NVEncC does the
+        // decode+encode+RPU-copy; ffmpeg remains the Jellyfin-monitored muxer and
+        // reads NVEncC's mpegts output from a FIFO (see BuildLidslabsNvenccArgs and
+        // TranscodeManager). Every miss below falls through to the stock path.
+        //
+        // Gate (ALL must hold):
+        //   - Flag LIDSLABS_TRANSCODE_NVENCC set (v0.4.0 namespace, off by default).
+        //   - Output codec is HEVC (NVEncC emits HEVC; a non-HEVC target is a
+        //     different negotiation and not our concern).
+        //   - Source is Dolby Vision with a usable HDR10 base: Profile 7 or 8.1.
+        //     Bare P5 (no HDR10 base) and P8.2 (SDR base) are excluded — nothing to
+        //     preserve as HDR — matching IsHdrPassthroughMode's DV allow-list.
+        //   - Client is DV-render-capable (reads in-band RPU): the friendly-name
+        //     CSV LIDSLABS_TRANSCODE_DV_CLIENTS, defaulting to the mpv family.
+        public static bool LidslabsNvenccEngineActive(EncodingJobInfo state)
+        {
+            if (state?.VideoStream is null)
+            {
+                return false;
+            }
+
+            var envFlag = Environment.GetEnvironmentVariable("LIDSLABS_TRANSCODE_NVENCC");
+            if (string.IsNullOrEmpty(envFlag)
+                || !(string.Equals(envFlag, "1", StringComparison.Ordinal)
+                     || string.Equals(envFlag, "true", StringComparison.OrdinalIgnoreCase)))
+            {
+                return false;
+            }
+
+            // Output must be an actual HEVC transcode (not a stream copy / direct play;
+            // a copy path never reaches the encoder and has nothing to convert).
+            var targetCodec = state.ActualOutputVideoCodec;
+            if (IsCopyCodec(targetCodec)
+                || (!string.Equals(targetCodec, "hevc", StringComparison.OrdinalIgnoreCase)
+                    && !string.Equals(targetCodec, "h265", StringComparison.OrdinalIgnoreCase)))
+            {
+                return false;
+            }
+
+            // Source must be Dolby Vision P7 or P8.1 (usable HDR10 base).
+            if (!IsDovi(state.VideoStream))
+            {
+                return false;
+            }
+
+            var dvProfile = state.VideoStream.DvProfile ?? -1;
+            var rangeType = state.VideoStream.VideoRangeType;
+            if (rangeType == VideoRangeType.DOVI          // bare P5, no HDR10 base
+                || rangeType == VideoRangeType.DOVIWithSDR // P8.2, SDR base
+                || (dvProfile != 7 && dvProfile != 8))
+            {
+                return false;
+            }
+
+            // Subtitle burn-in (Encode) or muxing an embedded subtitle stream into
+            // the output requires either a video filter or combining streams the
+            // FIFO stream-copy path can't touch (the video is `-c:v copy`; the source
+            // is a separate ffmpeg input). Those jobs fall through to the stock
+            // re-encoding path. External / HLS-sidecar subtitles are delivered
+            // separately and are unaffected.
+            if (state.SubtitleStream is not null
+                && (state.SubtitleDeliveryMethod == SubtitleDeliveryMethod.Encode
+                    || state.SubtitleDeliveryMethod == SubtitleDeliveryMethod.Embed))
+            {
+                return false;
+            }
+
+            var csv = Environment.GetEnvironmentVariable("LIDSLABS_TRANSCODE_DV_CLIENTS");
+            return LidslabsDvClientMatches(state.LidslabsClientName, csv);
+        }
+
+        // Matches the authenticated client app name against the DV-render-capable
+        // allow-list. Same friendly-name CSV mechanic as LIDSLABS_FORCE_HEVC_CLIENTS;
+        // when the env var is unset it defaults to the known mpv family that reads
+        // the in-band DV RPU. Case-insensitive substring match (client "Moonfin"
+        // matches entry "moonfin").
+        private static bool LidslabsDvClientMatches(string client, string csv)
+        {
+            if (string.IsNullOrWhiteSpace(client))
+            {
+                return false;
+            }
+
+            var list = string.IsNullOrWhiteSpace(csv) ? "moonfin,streamyfin" : csv;
+            foreach (var entry in list.Split(',', StringSplitOptions.RemoveEmptyEntries | StringSplitOptions.TrimEntries))
+            {
+                if (client.Contains(entry, StringComparison.OrdinalIgnoreCase))
+                {
+                    return true;
+                }
+            }
+
+            return false;
+        }
+
+        // Builds the NVEncC sidecar ARGUMENT string (no binary path) for the active
+        // job. TranscodeManager launches "/usr/bin/nvencc" (or LIDSLABS_NVENCC_PATH)
+        // with these args; it decodes the source in software (--avsw avoids the
+        // enhanced-NVDEC teardown exit=1 on P7 FEL), re-encodes HEVC Main10 keeping
+        // the DV RPU as P8.1, rate-controls with capped QVBR, and writes an mpegts
+        // stream (carries PTS so the downstream HLS muxer segments correctly) to the
+        // FIFO. gopLen (= ceil(segmentLength * framerate)) keys HLS segment splits to
+        // GOP boundaries; pass <= 0 to omit (progressive). The audio is NOT produced
+        // here — ffmpeg transcodes it from the source (NVEncC's eac3 is stereo-only).
+        public string BuildLidslabsNvenccArgs(EncodingJobInfo state, string fifoPath, int gopLen)
+        {
+            var ci = CultureInfo.InvariantCulture;
+            var sb = new StringBuilder();
+
+            sb.Append("--avsw");
+
+            var seekSeconds = TimeSpan.FromTicks(state.BaseRequest.StartTimeTicks ?? 0).TotalSeconds;
+            if (seekSeconds > 0)
+            {
+                sb.Append(CultureInfo.InvariantCulture, $" --seek {seekSeconds.ToString("0.###", ci)}");
+            }
+
+            sb.Append(" --codec hevc --profile main10 --preset p4");
+            sb.Append(" --dolby-vision-profile 8.1 --dolby-vision-rpu copy");
+            sb.Append(" --master-display copy --max-cll copy");
+
+            // Rate control: one global QVBR quality dial (tune on dev via
+            // LIDSLABS_TRANSCODE_NVENCC_QVBR; the spike's 24 is the default) capped by
+            // the per-user video ceiling. OutputVideoBitrate is already
+            // MaxStreamingBitrate minus the audio budget (Jellyfin computes it), in
+            // bits/sec; NVEncC --max-bitrate wants kbps.
+            var qvbr = 24;
+            var qvbrEnv = Environment.GetEnvironmentVariable("LIDSLABS_TRANSCODE_NVENCC_QVBR");
+            if (!string.IsNullOrWhiteSpace(qvbrEnv) && int.TryParse(qvbrEnv, NumberStyles.Integer, ci, out var qParsed) && qParsed > 0)
+            {
+                qvbr = qParsed;
+            }
+
+            sb.Append(CultureInfo.InvariantCulture, $" --qvbr {qvbr.ToString(ci)}");
+
+            var videoKbps = (state.OutputVideoBitrate ?? 0) / 1000;
+            if (videoKbps > 0)
+            {
+                sb.Append(CultureInfo.InvariantCulture, $" --max-bitrate {videoKbps.ToString(ci)}");
+            }
+
+            if (gopLen > 0)
+            {
+                sb.Append(CultureInfo.InvariantCulture, $" --gop-len {gopLen.ToString(ci)}");
+            }
+
+            sb.Append(" --output-format mpegts");
+            sb.Append(CultureInfo.InvariantCulture, $" -i \"{state.MediaPath}\" -o \"{fifoPath}\"");
+
+            return sb.ToString();
+        }
+
+        // GOP length (frames) that keys NVEncC keyframes to the HLS segment length,
+        // mirroring GetHlsVideoKeyFrameArguments' -g sizing. Falls back through the
+        // framerate accessors; 24 fps if the source declares none.
+        public static int GetLidslabsNvenccGopLen(EncodingJobInfo state, int segmentLength)
+        {
+            var framerate = state.VideoStream?.RealFrameRate
+                            ?? state.VideoStream?.AverageFrameRate
+                            ?? 24f;
+            return (int)Math.Ceiling(segmentLength * framerate);
+        }
+
         public static int GetVideoColorBitDepth(EncodingJobInfo state)
         {
             var videoStream = state.VideoStream;
@@ -7949,6 +8122,44 @@ namespace MediaBrowser.Controller.MediaEncoding
             var threads = GetNumberOfThreads(state, encodingOptions, videoCodec);
 
             var inputModifier = GetInputModifier(state, encodingOptions, null);
+
+            // lidslabs v0.4.0 — NVEncC transcode engine (muted-DV fix), progressive
+            // path. Same FIFO + sidecar shape as the HLS builder: NVEncC decodes +
+            // re-encodes the DV video (P7 -> P8.1 RPU copy) into an mpegts FIFO;
+            // ffmpeg here stream-copies that video (input 0) and transcodes audio
+            // from the source (input 1), muxing one continuous progressive stream.
+            // No HLS segment GOP alignment, so gopLen = 0. The gate excludes
+            // subtitle burn-in/embed, so no subtitle args are emitted here. ffmpeg's
+            // stdin stays free for Jellyfin's `q` stop. Fail-open: stock return below.
+            if (LidslabsNvenccEngineActive(state))
+            {
+                var fifoPath = outputPath + ".nvencc.ts";
+                state.LidslabsNvenccFifoPath = fifoPath;
+                state.LidslabsNvenccCommand = BuildLidslabsNvenccArgs(state, fifoPath, 0);
+
+                var audioSeek = (state.BaseRequest.StartTimeTicks ?? 0) > 0
+                    ? " -ss " + _mediaEncoder.GetTimeParameter(state.BaseRequest.StartTimeTicks ?? 0)
+                    : string.Empty;
+                var nvInput = string.Format(
+                    CultureInfo.InvariantCulture,
+                    "-thread_queue_size 8192 -i \"{0}\"{1} -i \"{2}\"",
+                    fifoPath,
+                    audioSeek,
+                    state.MediaPath);
+                var nvMap = state.AudioStream is not null
+                    ? string.Format(CultureInfo.InvariantCulture, "-map 0:v:0 -map 1:{0}", state.AudioStream.Index)
+                    : "-map 0:v:0";
+
+                return string.Format(
+                    CultureInfo.InvariantCulture,
+                    "{0} {1} -codec:v:0 copy -map_metadata -1 -map_chapters -1 -threads {2} {3}{4} -y \"{5}\"",
+                    nvInput,
+                    nvMap,
+                    threads,
+                    GetProgressiveVideoAudioArguments(state, encodingOptions),
+                    format,
+                    outputPath).Trim();
+            }
 
             return string.Format(
                 CultureInfo.InvariantCulture,

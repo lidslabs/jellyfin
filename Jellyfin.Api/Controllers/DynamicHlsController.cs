@@ -1683,6 +1683,54 @@ public class DynamicHlsController : BaseJellyfinApiController
             ? "-copyts -avoid_negative_ts make_zero"
             : "-copyts -avoid_negative_ts disabled";
 
+        // lidslabs v0.4.0 — NVEncC transcode engine (muted-DV fix). When active for
+        // this job, NVEncC does the decode+encode+DV-RPU-copy and writes an mpegts
+        // stream to a FIFO; ffmpeg here becomes a dumb muxer that stream-copies the
+        // video from that FIFO (input 0) and transcodes audio from the source
+        // (input 1). Crucially ffmpeg's stdin stays FREE so Jellyfin's `q` graceful
+        // stop still works — the video comes via the FIFO, not stdin. The nvencc
+        // command + FIFO path are stashed on state for TranscodeManager to launch
+        // the sidecar. The whole HLS mux/segment tail is reused unchanged. Any gate
+        // miss leaves the stock path below byte-identical (fail-open).
+        if (EncodingHelper.LidslabsNvenccEngineActive(state))
+        {
+            var fifoPath = outputPrefix + ".nvencc.ts";
+            var gopLen = EncodingHelper.GetLidslabsNvenccGopLen(state, state.SegmentLength);
+            state.LidslabsNvenccFifoPath = fifoPath;
+            state.LidslabsNvenccCommand = _encodingHelper.BuildLidslabsNvenccArgs(state, fifoPath, gopLen);
+
+            var audioSeek = (state.BaseRequest.StartTimeTicks ?? 0) > 0
+                ? " -ss " + _mediaEncoder.GetTimeParameter(state.BaseRequest.StartTimeTicks ?? 0)
+                : string.Empty;
+            var nvInput = string.Format(
+                CultureInfo.InvariantCulture,
+                "-thread_queue_size {0} -i \"{1}\"{2} -i \"{3}\"",
+                maxMuxingQueueSize,
+                fifoPath,
+                audioSeek,
+                state.MediaPath);
+            var nvMap = state.AudioStream is not null
+                ? string.Format(CultureInfo.InvariantCulture, "-map 0:v:0 -map 1:{0}", state.AudioStream.Index)
+                : "-map 0:v:0";
+
+            return string.Format(
+                CultureInfo.InvariantCulture,
+                "{0} -map_metadata -1 -map_chapters -1 -threads {1} {2} -codec:v:0 copy -start_at_zero {3} {4} -max_muxing_queue_size {5} -f hls -max_delay 5000000 -hls_time {6} -hls_segment_type {7} -start_number {8}{9} -hls_segment_filename \"{10}\" {11} -y \"{12}\"",
+                nvInput,
+                threads,
+                nvMap,
+                GetAudioArguments(state),
+                tsArgs,
+                maxMuxingQueueSize,
+                state.SegmentLength.ToString(CultureInfo.InvariantCulture),
+                segmentFormat,
+                startNumber.ToString(CultureInfo.InvariantCulture),
+                baseUrlParam,
+                EncodingUtils.NormalizePath(outputTsArg),
+                hlsArguments,
+                EncodingUtils.NormalizePath(outputPath)).Trim();
+        }
+
         return string.Format(
             CultureInfo.InvariantCulture,
             "{0} {1} -map_metadata -1 -map_chapters -1 -threads {2} {3} {4} {5} {6} -max_muxing_queue_size {7} -f hls -max_delay 5000000 -hls_time {8} -hls_segment_type {9} -start_number {10}{11} -hls_segment_filename \"{12}\" {13} -y \"{14}\"",

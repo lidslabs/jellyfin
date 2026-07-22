@@ -486,6 +486,13 @@ public sealed class TranscodeManager : ITranscodeManager, IDisposable
 
         process.Exited += (_, _) => OnFfMpegProcessExited(process, transcodingJob, state);
 
+        // lidslabs v0.4.0: if the NVEncC engine is active for this job, create the
+        // FIFO and launch the NVEncC sidecar BEFORE ffmpeg. ffmpeg (below) opens the
+        // FIFO for read; NVEncC opens it for write and pipes the DV-preserving mpegts
+        // in. open() on each end blocks until both are present, so either start order
+        // is deadlock-free. Sidecar + FIFO are tracked on the job for teardown.
+        StartLidslabsNvenccSidecar(state, transcodingJob);
+
         try
         {
             process.Start();
@@ -537,6 +544,98 @@ public sealed class TranscodeManager : ITranscodeManager, IDisposable
         _logger.LogDebug("StartFfMpeg() finished successfully");
 
         return transcodingJob;
+    }
+
+    [System.Runtime.InteropServices.DllImport("libc", SetLastError = true)]
+    private static extern int mkfifo(string pathname, uint mode);
+
+    // lidslabs v0.4.0 — NVEncC transcode engine (muted-DV fix). When the encoding
+    // layer flagged this job for NVEncC (state.LidslabsNvenccCommand populated), the
+    // emitted ffmpeg command reads its video from a FIFO instead of decoding the
+    // source itself. Here we create that FIFO and launch NVEncC as a sidecar to fill
+    // it (DV P7 -> P8.1 RPU copy, HEVC Main10, capped QVBR mpegts). The sidecar is
+    // tracked on the job so TranscodingJob.Stop kills it (belt-and-suspenders over
+    // the SIGPIPE it gets when ffmpeg closes the FIFO). No-op for stock jobs.
+    private void StartLidslabsNvenccSidecar(StreamState state, TranscodingJob transcodingJob)
+    {
+        var nvenccArgs = state.LidslabsNvenccCommand;
+        var fifoPath = state.LidslabsNvenccFifoPath;
+        if (string.IsNullOrEmpty(nvenccArgs) || string.IsNullOrEmpty(fifoPath))
+        {
+            return;
+        }
+
+        try
+        {
+            if (File.Exists(fifoPath))
+            {
+                File.Delete(fifoPath);
+            }
+
+            // 0600 (owner rw) — the FIFO is private to this transcode.
+            if (mkfifo(fifoPath, 0x180) != 0)
+            {
+                var err = System.Runtime.InteropServices.Marshal.GetLastWin32Error();
+                throw new IOException($"mkfifo failed for '{fifoPath}' (errno {err})");
+            }
+
+            transcodingJob.LidslabsNvenccFifoPath = fifoPath;
+
+            var nvenccPath = Environment.GetEnvironmentVariable("LIDSLABS_NVENCC_PATH");
+            if (string.IsNullOrWhiteSpace(nvenccPath))
+            {
+                nvenccPath = "/usr/bin/nvencc";
+            }
+
+            var sidecar = new Process
+            {
+                StartInfo = new ProcessStartInfo
+                {
+                    WindowStyle = ProcessWindowStyle.Hidden,
+                    CreateNoWindow = true,
+                    UseShellExecute = false,
+                    RedirectStandardError = true,
+                    FileName = nvenccPath,
+                    Arguments = nvenccArgs,
+                    ErrorDialog = false
+                },
+                EnableRaisingEvents = true
+            };
+
+            _logger.LogInformation("Launching lidslabs NVEncC sidecar: {Filename} {Arguments}", nvenccPath, nvenccArgs);
+
+            var nvenccLogPath = Path.Combine(
+                _serverConfigurationManager.ApplicationPaths.LogDirectoryPath,
+                $"NVEncC.Transcode-{DateTime.Now:yyyy-MM-dd_HH-mm-ss}_{Guid.NewGuid().ToString()[..8]}.log");
+
+            sidecar.Start();
+            transcodingJob.LidslabsNvenccSidecar = sidecar;
+
+            // Drain NVEncC's stderr to a log file so it can't deadlock on a full pipe
+            // and so its progress/errors are captured for debugging.
+            _ = Task.Run(async () =>
+            {
+                try
+                {
+                    await using var nvenccLog = new FileStream(
+                        nvenccLogPath,
+                        FileMode.Create,
+                        FileAccess.Write,
+                        FileShare.Read,
+                        IODefaults.FileStreamBufferSize,
+                        FileOptions.Asynchronous);
+                    await sidecar.StandardError.BaseStream.CopyToAsync(nvenccLog).ConfigureAwait(false);
+                }
+                catch (Exception ex)
+                {
+                    _logger.LogError(ex, "Error draining lidslabs NVEncC sidecar log");
+                }
+            });
+        }
+        catch (Exception ex)
+        {
+            _logger.LogError(ex, "Failed to start lidslabs NVEncC sidecar; the ffmpeg job will likely fail to open its FIFO input");
+        }
     }
 
     private void StartThrottler(StreamState state, TranscodingJob transcodingJob)

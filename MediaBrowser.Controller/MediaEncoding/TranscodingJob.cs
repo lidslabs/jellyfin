@@ -1,5 +1,6 @@
 using System;
 using System.Diagnostics;
+using System.IO;
 using System.Threading;
 using MediaBrowser.Model.Dto;
 using Microsoft.Extensions.Logging;
@@ -60,6 +61,21 @@ public sealed class TranscodingJob : IDisposable
     /// Gets or sets the process.
     /// </summary>
     public Process? Process { get; set; }
+
+    /// <summary>
+    /// Gets or sets the lidslabs NVEncC sidecar process (v0.4.0 muted-DV engine).
+    /// When set, this decodes+encodes the DV video and pipes mpegts into the FIFO
+    /// that the monitored ffmpeg (Process) stream-copies. It normally dies on its
+    /// own via SIGPIPE when ffmpeg closes the FIFO, but that can lag a beat, so it
+    /// is also explicitly killed on Stop to guarantee no orphaned GPU encoder.
+    /// Null on all stock (non-NVEncC) jobs.
+    /// </summary>
+    public Process? LidslabsNvenccSidecar { get; set; }
+
+    /// <summary>
+    /// Gets or sets the lidslabs NVEncC FIFO path (v0.4.0), deleted on cleanup.
+    /// </summary>
+    public string? LidslabsNvenccFifoPath { get; set; }
 
     /// <summary>
     /// Gets or sets the active request count.
@@ -268,6 +284,29 @@ public sealed class TranscodingJob : IDisposable
                 }
             }
 #pragma warning restore CA1849
+
+            // lidslabs v0.4.0: tear down the NVEncC sidecar. Closing ffmpeg's FIFO
+            // read end above SIGPIPEs it, but only on its next write (can lag ~1-2s),
+            // so kill it explicitly to guarantee the GPU encoder is released now.
+            var sidecar = LidslabsNvenccSidecar;
+            if (sidecar is not null)
+            {
+                try
+                {
+                    if (!sidecar.HasExited)
+                    {
+                        _logger.LogInformation("Killing lidslabs NVEncC sidecar for {Path}", Path);
+                        sidecar.Kill();
+                    }
+                }
+                catch (InvalidOperationException)
+                {
+                }
+                catch (Exception ex)
+                {
+                    _logger.LogError(ex, "Error killing lidslabs NVEncC sidecar for {Path}", Path);
+                }
+            }
         }
     }
 
@@ -276,6 +315,25 @@ public sealed class TranscodingJob : IDisposable
     {
         Process?.Dispose();
         Process = null;
+        // lidslabs v0.4.0: dispose the NVEncC sidecar and remove its FIFO.
+        LidslabsNvenccSidecar?.Dispose();
+        LidslabsNvenccSidecar = null;
+        if (!string.IsNullOrEmpty(LidslabsNvenccFifoPath))
+        {
+            try
+            {
+                if (File.Exists(LidslabsNvenccFifoPath))
+                {
+                    File.Delete(LidslabsNvenccFifoPath);
+                }
+            }
+            catch (IOException)
+            {
+            }
+
+            LidslabsNvenccFifoPath = null;
+        }
+
         _killTimer?.Dispose();
         _killTimer = null;
         CancellationTokenSource?.Dispose();

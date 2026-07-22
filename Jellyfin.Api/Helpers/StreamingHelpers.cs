@@ -79,7 +79,11 @@ public static class StreamingHelpers
         {
             Request = streamingRequest,
             RequestedUrl = url,
-            UserAgent = httpRequest.Headers[HeaderNames.UserAgent]
+            UserAgent = httpRequest.Headers[HeaderNames.UserAgent],
+            // lidslabs v0.4.0 (NVEncC engine): capture the authenticated client app
+            // name here (the encoding layer can't reach the ClaimsPrincipal) so the
+            // DV-render-capable gate can match it. Same identity as the Swiftfin gate.
+            LidslabsClientName = httpContext.User.GetClient()
         };
 
         var userId = httpContext.User.GetUserId();
