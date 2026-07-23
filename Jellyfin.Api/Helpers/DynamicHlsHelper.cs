@@ -279,19 +279,20 @@ public class DynamicHlsHelper
             // AVPlayer commits to the master and (for capable builds) selects the PQ variant
             // (verified: Swiftfin plays HDR from start/seek/resume; Neptune AV plays SDR).
             //
-            // SCOPE (LidslabsSdrLadderClient): fire ONLY for the known-AVPlayer allowlist.
-            // Every other client already worked without the rung and pays a real cost if it
-            // gets one -- e.g. Moonfin eagerly spins up BOTH rungs at start, so two 1440p
-            // NVENC transcodes contend on CUDA init + source probe and starve the opening
-            // segments (~10 s black before it self-heals). Clients that play HDR natively
-            // (Trident), via mpv (Streamyfin), or that we have not characterised (Android TV,
-            // web) therefore get the clean HDR-only master. We match on the authenticated
-            // client name because DeviceProfile.Name is not posted on this GET; that means the
-            // Neptune app's AV Player and Trident modes (same client name + UA) both match, but
-            // that is harmless -- Trident has always received this rung and simply plays HDR.
+            // SCOPE (LidslabsSdrLadderRequested): fire ONLY when PlaybackInfo tagged this
+            // stream for the known-AVPlayer allowlist. Every other client already worked
+            // without the rung and pays a real cost if it gets one -- e.g. Moonfin eagerly
+            // spins up BOTH rungs at start, so two 1440p NVENC transcodes contend on CUDA init
+            // + source probe and starve the opening segments (~10 s black before it
+            // self-heals). Clients that play HDR natively (Trident), via mpv (Streamyfin), or
+            // that we have not characterised (Android TV, web) therefore get the clean
+            // HDR-only master. The decision is made at PlaybackInfo (MediaInfoController),
+            // where the client name AND DeviceProfile.Name are both reliable, and carried here
+            // as a TranscodingUrl marker; the master.m3u8 GET's ?ApiKey= auth makes
+            // User.GetClient() unreliable at this point, so we must not re-derive it here.
             if (EncodingHelper.IsHdrPassthroughMode(state)
                 && !EncodingHelper.IsCopyCodec(state.OutputVideoCodec)
-                && LidslabsSdrLadderClient())
+                && LidslabsSdrLadderRequested())
             {
                 var originalVideoCodec = state.OutputVideoCodec;
                 state.OutputVideoCodec = "h264";
@@ -365,39 +366,23 @@ public class DynamicHlsHelper
     }
 
     /// <summary>
-    /// lidslabs v0.3.3: whether the requesting client is on the SDR-ladder allowlist.
-    /// The H.264 SDR companion rung on an HDR-passthrough master exists solely to make
-    /// Apple AVPlayer clients commit to the master; every other client already worked
-    /// without it and some pay a real cost for it (see the call site). We can only match
-    /// on the authenticated client name here — DeviceProfile.Name is not posted on the
-    /// master.m3u8 GET — so the Neptune app's AV Player and Trident modes both match; that
-    /// is harmless (Trident plays HDR and ignores the rung). Default allowlist is the known
-    /// AVPlayer clients; override with LIDSLABS_SDR_LADDER_CLIENTS (comma-separated
-    /// client-name substrings, matched case-insensitively).
+    /// lidslabs v0.3.3: whether the SDR companion rung was requested for this stream.
+    /// The rung exists solely to make Apple AVPlayer clients commit to an HDR master; every
+    /// other client already worked without it and some pay a real cost for it (see the call
+    /// site). The AVPlayer-client decision is made upstream at PlaybackInfo — the only place
+    /// where both the authenticated client name AND DeviceProfile.Name are reliable — which
+    /// tags the TranscodingUrl with LidslabsSdrLadder=1. We must NOT re-derive it here: the
+    /// master.m3u8 GET is authenticated by an ?ApiKey= query for AVPlayer clients, so
+    /// User.GetClient() does not reliably resolve the client at this point (it returned
+    /// nothing for Swiftfin while resolving for Neptune — the exact split that regressed).
+    /// Reading the marker the client echoes back is auth-independent and precise (Trident,
+    /// separable from Neptune AV only by DeviceProfile.Name, is correctly excluded upstream).
     /// </summary>
-    private bool LidslabsSdrLadderClient()
-    {
-        var clientName = _httpContextAccessor.HttpContext?.User.GetClient();
-        if (string.IsNullOrWhiteSpace(clientName))
-        {
-            return false;
-        }
-
-        var configured = Environment.GetEnvironmentVariable("LIDSLABS_SDR_LADDER_CLIENTS");
-        var tokens = string.IsNullOrWhiteSpace(configured)
-            ? new[] { "Swiftfin", "Neptune" }
-            : configured.Split(',', StringSplitOptions.RemoveEmptyEntries | StringSplitOptions.TrimEntries);
-
-        foreach (var token in tokens)
-        {
-            if (clientName.Contains(token, StringComparison.OrdinalIgnoreCase))
-            {
-                return true;
-            }
-        }
-
-        return false;
-    }
+    private bool LidslabsSdrLadderRequested()
+        => string.Equals(
+            _httpContextAccessor.HttpContext?.Request.Query["LidslabsSdrLadder"].ToString(),
+            "1",
+            StringComparison.Ordinal);
 
     private StringBuilder AppendPlaylist(StringBuilder builder, StreamState state, string url, int bitrate, string? subtitleGroup)
     {
