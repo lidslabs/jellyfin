@@ -194,12 +194,14 @@ public class MediaInfoController : BaseJellyfinApiController
         // HEVC makes it a clean, Apple-compliant HDR10-HEVC fMP4 stream (verified
         // 2026-07-23: hvc1 + colr BT.2020/PQ + mdcv + clli, re-decodes error-free;
         // the P7 EL block-addition notice is benign). Swiftfin already negotiates
-        // Container=mp4 so it needs no fMP4 force. CAVEAT: this is under device test —
-        // Neptune's sibling AVPlayer engine historically rejected VIDEO-RANGE=PQ and
-        // needed force-SDR, so Swiftfin's AVPlayer may too. Env-toggleable precisely
-        // so on/off can be A/B'd on one image; the earlier 0018 force-HEVC attempt
-        // also carried a DV-P7 EL-strip rework (now known unnecessary) that confounded
-        // its result.
+        // Container=mp4 so it needs no fMP4 force. RESOLVED 2026-07-23: AVPlayer's
+        // earlier VIDEO-RANGE=PQ rejection was an HDR-ONLY-master problem, not an HDR
+        // problem — with the H.264 SDR companion rung now in the master (patch 0020),
+        // Swiftfin plays HDR from start, seek and resume (all verified on device). The
+        // old force-SDR workaround was removed in v0.3.3. Kept env-toggleable so
+        // forced-HEVC on/off can still be A/B'd on one image; the earlier 0018
+        // force-HEVC attempt also carried a DV-P7 EL-strip rework (now known
+        // unnecessary) that confounded its result.
         var lidslabsSwiftfinForceHevc =
             lidslabsSwiftfinClient
             && (Environment.GetEnvironmentVariable("LIDSLABS_FORCE_HEVC_CLIENTS") ?? string.Empty)
@@ -335,80 +337,18 @@ public class MediaInfoController : BaseJellyfinApiController
                     itemId);
             }
 
-            // lidslabs v0.3.2 (patch 0011): force listed clients back to SDR. Some
-            // AVPlayer-family tvOS clients (Neptune AV Player) advertise HDR10 HEVC
-            // but cannot ingest an HDR-over-HLS stream: they reject the master
-            // playlist's VIDEO-RANGE=PQ and never request a segment, so the screen
-            // stays black. The global HDR-passthrough path
-            // (LIDSLABS_ALLOW_HDR_TRANSCODE) hands HDR to every client regardless of
-            // whether it asked for it, which is what breaks them. Rather than match
-            // these clients by User-Agent at transcode time — where AV Player and
-            // Trident are indistinguishable (same app UA) — decide HERE at
-            // PlaybackInfo, where DeviceProfile.Name gives the collision-safe
-            // delineation ("Neptune tvOS" vs "Neptune tvOS (Trident)"), reusing the
-            // same LidslabsClientMatches map as the forced-HEVC lever. For a matched
-            // client we PREPEND a hevc CodecProfile pinning the transcode target range
-            // to SDR (Equals VideoRangeType=SDR). Prepend (not append) so it takes
-            // highest priority in StreamBuilder's reversed codec-profile walk and
-            // wins over any HDR10 range the client also declares. StreamBuilder then
-            // emits &VideoRangeType=SDR on the transcode URL; the paired guard in
-            // EncodingHelper.IsHdrPassthroughMode honors that requested SDR range and
-            // drops out of HDR passthrough, flipping the HLS master VIDEO-RANGE and
-            // the ffmpeg tonemap together. The forced HEVC codec is preserved — this
-            // is a colour-range downgrade (HDR->SDR tonemap), NOT a codec change, so
-            // efficiency is retained. Runtime-tunable via LIDSLABS_FORCE_SDR_CLIENTS
-            // (add/remove a client with a compose edit + restart, no image rebuild).
-            // Inert on SDR sources: the Equals-SDR condition is already satisfied, so
-            // nothing is forced and direct-play/copy is unaffected. Idempotent:
-            // skipped if this hevc Equals-SDR pin is already present.
-            var lidslabsForceSdrEligible =
-                LidslabsClientMatches(
-                    profile.Name,
-                    Environment.GetEnvironmentVariable("LIDSLABS_FORCE_SDR_CLIENTS"));
-
-            // Gate-decision diagnostic (Debug; dormant at Information level, like the
-            // forced-HEVC gate above). Raise the level to Debug to confirm whether a
-            // client is seen as force-SDR-eligible in a single cycle.
-            _logger.LogDebug(
-                "lidslabs.forceSdr gate: profile={ProfileName}, clients={Clients}, eligible={Eligible}",
-                profile.Name,
-                Environment.GetEnvironmentVariable("LIDSLABS_FORCE_SDR_CLIENTS"),
-                lidslabsForceSdrEligible);
-
-            if (lidslabsForceSdrEligible)
-            {
-                var alreadyForcedSdr = profile.CodecProfiles
-                    .Where(cp => cp.Type == CodecType.Video
-                                 && LidslabsSplitTrim(cp.Codec).Contains("hevc", StringComparer.OrdinalIgnoreCase))
-                    .Any(cp => cp.Conditions.Any(c =>
-                        c.Property == ProfileConditionValue.VideoRangeType
-                        && c.Condition == ProfileConditionType.Equals
-                        && string.Equals(c.Value, "SDR", StringComparison.OrdinalIgnoreCase)));
-
-                if (!alreadyForcedSdr)
-                {
-                    var forceSdr = new CodecProfile
-                    {
-                        Type = CodecType.Video,
-                        Codec = "hevc",
-                        Conditions = new[]
-                        {
-                            new ProfileCondition(
-                                ProfileConditionType.Equals,
-                                ProfileConditionValue.VideoRangeType,
-                                "SDR",
-                                false),
-                        },
-                    };
-
-                    profile.CodecProfiles = new[] { forceSdr }.Concat(profile.CodecProfiles).ToArray();
-
-                    _logger.LogInformation(
-                        "lidslabs: forced-SDR override applied (prepended hevc VideoRangeType=SDR) for profile={ProfileName}, item={ItemId}",
-                        profile.Name,
-                        itemId);
-                }
-            }
+            // lidslabs v0.3.3: the force-listed-clients-back-to-SDR lever (patches 0011
+            // and 0014, env LIDSLABS_FORCE_SDR_CLIENTS) was REMOVED here. It existed for
+            // AVPlayer-family tvOS clients (Neptune AV Player) that advertise HDR10 HEVC
+            // yet stalled on an HDR-over-HLS master — they rejected an HDR-ONLY master's
+            // VIDEO-RANGE=PQ and never requested a segment. The real cause was the master
+            // advertising a single PQ variant; AVPlayer refuses to enter an HDR-only
+            // ladder. The HDR-passthrough master now carries an H.264 SDR companion rung
+            // (DynamicHlsHelper, patch 0020), so AVPlayer clients start from the SDR rung
+            // and switch up to HDR on their own — Neptune AV now self-selects and plays
+            // with no force-SDR needed. With the last force-SDR client gone, the lever and
+            // its paired delivered-range SDR rewrite are dropped. The shared client matcher
+            // (LidslabsClientMatches) stays — it still backs the forced-HEVC lever.
 
             // lidslabs 2026-07-21: the Swiftfin DV Profile 7 EL strip was REMOVED
             // here. It correctly forced P7 off direct-play, but for v1.5 that meant
@@ -450,30 +390,23 @@ public class MediaInfoController : BaseJellyfinApiController
             // "DOVI*" range to kCMVideoCodecType_DolbyVisionHEVC and any HDR range to a
             // PQ/HLG HDMI mode) selects a display mode for the SOURCE and then receives
             // bytes that don't match -> washed-out / wrong-gamut colors, plus a spurious
-            // Dolby Vision banner for DV. There are two delivered-range cases, keyed on
-            // what the transcode actually emits:
-            //
-            //   * force-SDR eligible (LIDSLABS_FORCE_SDR_CLIENTS): the HDR/DV source is
-            //     tonemapped to SDR (bt.709). Report SDR and clear the DV descriptors so
-            //     the client does NOT engage DV/HDR — no re-engaged DV mode, no DV banner
-            //     popped over a stream that is actually SDR.
-            //   * HDR passthrough (LIDSLABS_ALLOW_HDR_TRANSCODE, not force-SDR): a DV
-            //     source is passed through as clean HDR10/HLG (no RPU, no -dolby_vision;
-            //     the HLS master advertises VIDEO-RANGE=PQ), so flatten the DV
-            //     descriptors and the range resolves to HDR10 (smpte2084) / HLG
-            //     (arib-std-b67) from ColorTransfer, matching the bytes. A native
-            //     HDR10/HLG source already reports correctly and is left untouched.
+            // Dolby Vision banner for DV. The delivered-range case (HDR passthrough,
+            // LIDSLABS_ALLOW_HDR_TRANSCODE): a DV source is passed through as clean
+            // HDR10/HLG (no RPU, no -dolby_vision; the HLS master advertises
+            // VIDEO-RANGE=PQ), so flatten the DV descriptors and the range resolves to
+            // HDR10 (smpte2084) / HLG (arib-std-b67) from ColorTransfer, matching the
+            // bytes. A native HDR10/HLG source already reports correctly and is left
+            // untouched.
             //
             // VideoRangeType is a COMPUTED property (MediaStream.GetVideoColorRange)
             // derived from the DV fields + Hdr10PlusPresentFlag + ColorTransfer, so we
-            // rewrite those (and, for force-SDR, the color* metadata to bt.709 to mirror
-            // the ffmpeg tonemap output). This mutates only the per-request response
+            // rewrite those. This mutates only the per-request response
             // clone (MediaInfoHelper deep-clones MediaSources before we touch them),
             // never library metadata. Scope: transcode only (TranscodingUrl set). The
             // play decision (SupportsDirectPlay / TranscodingUrl) is finalized above and
             // is NOT changed here, so no client can flip to direct-playing off the
             // rewritten range. Range only; a codec/profile rewrite is a separate follow-up.
-            if (lidslabsForceSdrEligible || LidslabsHdrTranscodeEnabled())
+            if (LidslabsHdrTranscodeEnabled())
             {
                 foreach (var mediaSource in info.MediaSources)
                 {
@@ -489,34 +422,8 @@ public class MediaInfoController : BaseJellyfinApiController
                         continue;
                     }
 
-                    // Read the computed range/range-class BEFORE clearing any fields.
+                    // Read the computed range BEFORE clearing any fields.
                     var rangeType = videoStream.VideoRangeType;
-                    var (videoRange, _) = videoStream.GetVideoColorRange();
-
-                    if (lidslabsForceSdrEligible)
-                    {
-                        // The transcode tonemaps to SDR. Only HDR/DV sources need the
-                        // rewrite; an SDR source already matches the SDR output.
-                        if (videoRange != VideoRange.HDR)
-                        {
-                            continue;
-                        }
-
-                        LidslabsClearDoViDescriptors(videoStream);
-                        // Flatten HDR color metadata to bt.709 so the range computes SDR
-                        // (mirrors the ffmpeg tonemap: bt709 primaries/transfer/matrix).
-                        videoStream.ColorPrimaries = "bt709";
-                        videoStream.ColorTransfer = "bt709";
-                        videoStream.ColorSpace = "bt709";
-                        videoStream.Hdr10PlusPresentFlag = null;
-
-                        _logger.LogInformation(
-                            "lidslabs: PlaybackInfo delivered-range rewrite (force-SDR: {SourceRange} -> SDR) for profile={ProfileName}, item={ItemId}",
-                            rangeType,
-                            profile.Name,
-                            itemId);
-                        continue;
-                    }
 
                     // HDR passthrough: only DV ranges whose HDR10/HLG base survives
                     // passthrough are eligible (bare DOVI profile 5 and DOVIWithSDR
@@ -619,22 +526,13 @@ public class MediaInfoController : BaseJellyfinApiController
                     //     live capture (neptune/151, app 0.1.6) — DEBUG_LOG 2026-07-01.
                     "neptune_av" => profileName.Contains("Neptune tvOS", StringComparison.OrdinalIgnoreCase)
                                     && !profileName.Contains("Trident", StringComparison.OrdinalIgnoreCase),
-                    // lidslabs 2026-07-04: Moonfin (DeviceProfile.Name "Moonfin", client
-                    //     "Moonfin for tvOS", confirmed in the dev capture). Mapped so it
-                    //     can take the force-SDR lever. The earlier "intentionally NOT
-                    //     mapped" note was based on the 2026-07-02 black screen, which was a
-                    //     master.m3u8 HTTP 400 (self-rejected URL, fixed by patch 0012) —
-                    //     NOT an HDR problem. With playback working, Moonfin's HDR TRANSCODE
-                    //     washes out: its mpv render path cannot engage HDR (the
-                    //     outputProvidesHdr()/EDR-headroom gate — an upstream client bug that
-                    //     is NOT server-fixable). force-SDR converts that washout into a
-                    //     correct SDR image (HEVC preserved). The usual force-SDR side effect
-                    //     (it disqualifies HDR/DV DIRECT PLAY) has no path to hit here:
-                    //     Moonfin is used only by external, bitrate-limited clients that are
-                    //     always transcoding. "Moonfin" is collision-free vs "Trident" /
-                    //     "Neptune tvOS" / "1. MPV". See DEBUG_LOG.md 2026-07-04 and
-                    //     .project/moonfin-hdr-mpv-washout-issue.md.
-                    "moonfin" => profileName.Contains("Moonfin", StringComparison.OrdinalIgnoreCase),
+                    // lidslabs v0.3.3: the "moonfin" arm (patch 0014) was REMOVED. It was
+                    //     added only so Moonfin could take the force-SDR lever, which
+                    //     worked around an mpv HDR-render washout. That lever is gone
+                    //     (see the force-SDR removal note above), and Moonfin now renders
+                    //     HDR passthrough correctly on dev — no special-casing needed. If
+                    //     the washout ever returns, re-add the arm; the history is in
+                    //     DEBUG_LOG.md 2026-07-04 and .project/moonfin-hdr-mpv-washout-issue.md.
                     _ => false,
                 };
 
@@ -649,8 +547,8 @@ public class MediaInfoController : BaseJellyfinApiController
 
         // lidslabs v0.3.2: strip the Dolby Vision descriptors from a
         // response-clone video MediaStream so its COMPUTED VideoRangeType stops
-        // resolving to a DOVI* range. Shared by both delivered-range rewrite branches
-        // (force-SDR -> SDR, and HDR passthrough -> HDR10/HLG). Clears the DV metadata
+        // resolving to a DOVI* range. Used by the HDR-passthrough delivered-range
+        // rewrite (DV -> HDR10/HLG). Clears the DV metadata
         // fields plus the dovi/dvh1/dvhe/dav1 CodecTag (GetVideoColorRange keys the DOVI
         // branch off both). Mutates only the per-request clone, never library metadata.
         static void LidslabsClearDoViDescriptors(MediaStream videoStream)
