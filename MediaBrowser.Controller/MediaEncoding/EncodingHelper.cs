@@ -8065,24 +8065,15 @@ namespace MediaBrowser.Controller.MediaEncoding
                         args += " -copyts";
                     }
 
-                    // HDR passthrough: use make_zero (not disabled) as a defensive
-                    // timestamp normalization. Originally added to defend against
-                    // negative tfdt boxes when this build used fMP4 segments
-                    // (ExoPlayer rejects negative tfdt with "Top bit not zero").
-                    // We're on MPEG-TS now and TS has no tfdt box, so this is
-                    // largely defensive - but it's also harmless and safer than
-                    // "disabled" if delivery is ever switched back. See the
-                    // matching logic in DynamicHlsController.GetVideoArguments'
-                    // tsArgs. This branch only fires when CopyTimestamps is
-                    // enabled; the controller handles the default path.
-                    if (IsHdrPassthroughMode(state))
-                    {
-                        args += " -avoid_negative_ts make_zero";
-                    }
-                    else
-                    {
-                        args += " -avoid_negative_ts disabled";
-                    }
+                    // Use the stock "disabled" for HDR passthrough too. A prior
+                    // make_zero special-case (guarding a negative-tfdt ExoPlayer crash
+                    // seen on an earlier fMP4 iteration) broke HLS seek/resume once we
+                    // returned to fMP4: make_zero shifts a seek segment's tfdt to ~0
+                    // while the media playlist still positions it at N*segLen, so strict
+                    // players (AVPlayer, mpv) stall on resume. "disabled" preserves the
+                    // seek offset; from-start output is IDR-first (tfdt=0) so it stays
+                    // non-negative. See DynamicHlsController.GetVideoArguments tsArgs.
+                    args += " -avoid_negative_ts disabled";
 
                     if (!(state.SubtitleStream is not null && state.SubtitleStream.IsExternal && !state.SubtitleStream.IsTextSubtitleStream))
                     {
