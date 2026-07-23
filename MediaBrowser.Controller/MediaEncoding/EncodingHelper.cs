@@ -6506,16 +6506,16 @@ namespace MediaBrowser.Controller.MediaEncoding
                 return false;
             }
 
-            // lidslabs v0.3.2 (patch 0011): honor an explicit SDR output request.
-            // Without this, IsHdrPassthroughMode ignores the client's requested range
-            // and forces HDR passthrough onto every eligible HDR source — which
-            // black-screens AVPlayer-family tvOS clients that cannot ingest
-            // HDR-over-HLS (they reject the master playlist's VIDEO-RANGE=PQ). When
-            // the negotiated transcode target range is SDR — pinned via the
-            // VideoRangeType=SDR CodecProfile that the PlaybackInfo
-            // LIDSLABS_FORCE_SDR_CLIENTS lever injects, or requested by any client
-            // that genuinely wants SDR — drop out of passthrough and let the stock
-            // tonemap path run. Because this is the single gate authoring BOTH the HLS
+            // lidslabs v0.3.2: honor an explicit SDR output request. Without this,
+            // IsHdrPassthroughMode ignores the client's requested range and forces HDR
+            // passthrough onto every eligible HDR source. When the negotiated transcode
+            // target range is SDR — requested by any client (or rung) that genuinely
+            // wants SDR, e.g. the H.264 SDR companion rung the HDR-passthrough master
+            // now advertises for AVPlayer clients (DynamicHlsHelper, patch 0020) — drop
+            // out of passthrough and let the stock tonemap path run. (The v0.3.2
+            // LIDSLABS_FORCE_SDR_CLIENTS lever that once injected a VideoRangeType=SDR
+            // CodecProfile to reach this gate was removed in v0.3.3; the SDR ladder
+            // replaced it.) Because this is the single gate authoring BOTH the HLS
             // master VIDEO-RANGE (DynamicHlsHelper) and the ffmpeg filter chain, the
             // manifest and the encode flip to SDR together — no PQ-manifest /
             // tonemapped-segment mismatch. Only the colour range is downgraded; the
