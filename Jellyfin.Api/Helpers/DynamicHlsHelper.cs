@@ -268,19 +268,30 @@ public class DynamicHlsHelper
                 state.OutputVideoCodec = "copy";
             }
 
-            // lidslabs (v0.4.0 experiment): the HDR *passthrough transcode* path emits a
-            // single VIDEO-RANGE=PQ variant with no SDR companion. Apple AVPlayer (Swiftfin /
-            // Neptune AV) silently refuses to start such an HDR-only master -- it fetches the
-            // media playlist then never requests a segment (stalls with no error). Stock
+            // lidslabs v0.3.3: the HDR *passthrough transcode* path emits a single
+            // VIDEO-RANGE=PQ variant with no SDR companion. Apple AVPlayer clients (Swiftfin,
+            // Neptune AV) silently refuse to start such an HDR-only master -- they fetch the
+            // media playlist then never request a segment (stall with no error). Stock
             // Jellyfin already provides an SDR entrance for HDR content, but only on the copy
             // path (the IsCopyCodec guards above); our passthrough is a transcode
             // (OutputVideoCodec = hevc), so it never got one. Add an H.264 (tonemapped SDR)
             // companion so the master advertises an HDR+SDR ladder; on an HDR-capable display
-            // AVPlayer should commit to the master and still select the PQ variant. Uses a
-            // copy of the query so downstream (adaptive) variants are unaffected, and restores
-            // the real output codec. Copy + SDR-source paths are untouched.
+            // AVPlayer commits to the master and (for capable builds) selects the PQ variant
+            // (verified: Swiftfin plays HDR from start/seek/resume; Neptune AV plays SDR).
+            //
+            // SCOPE (LidslabsSdrLadderClient): fire ONLY for the known-AVPlayer allowlist.
+            // Every other client already worked without the rung and pays a real cost if it
+            // gets one -- e.g. Moonfin eagerly spins up BOTH rungs at start, so two 1440p
+            // NVENC transcodes contend on CUDA init + source probe and starve the opening
+            // segments (~10 s black before it self-heals). Clients that play HDR natively
+            // (Trident), via mpv (Streamyfin), or that we have not characterised (Android TV,
+            // web) therefore get the clean HDR-only master. We match on the authenticated
+            // client name because DeviceProfile.Name is not posted on this GET; that means the
+            // Neptune app's AV Player and Trident modes (same client name + UA) both match, but
+            // that is harmless -- Trident has always received this rung and simply plays HDR.
             if (EncodingHelper.IsHdrPassthroughMode(state)
-                && !EncodingHelper.IsCopyCodec(state.OutputVideoCodec))
+                && !EncodingHelper.IsCopyCodec(state.OutputVideoCodec)
+                && LidslabsSdrLadderClient())
             {
                 var originalVideoCodec = state.OutputVideoCodec;
                 state.OutputVideoCodec = "h264";
@@ -351,6 +362,41 @@ public class DynamicHlsHelper
         }
 
         return new FileContentResult(Encoding.UTF8.GetBytes(builder.ToString()), MimeTypes.GetMimeType("playlist.m3u8"));
+    }
+
+    /// <summary>
+    /// lidslabs v0.3.3: whether the requesting client is on the SDR-ladder allowlist.
+    /// The H.264 SDR companion rung on an HDR-passthrough master exists solely to make
+    /// Apple AVPlayer clients commit to the master; every other client already worked
+    /// without it and some pay a real cost for it (see the call site). We can only match
+    /// on the authenticated client name here — DeviceProfile.Name is not posted on the
+    /// master.m3u8 GET — so the Neptune app's AV Player and Trident modes both match; that
+    /// is harmless (Trident plays HDR and ignores the rung). Default allowlist is the known
+    /// AVPlayer clients; override with LIDSLABS_SDR_LADDER_CLIENTS (comma-separated
+    /// client-name substrings, matched case-insensitively).
+    /// </summary>
+    private bool LidslabsSdrLadderClient()
+    {
+        var clientName = _httpContextAccessor.HttpContext?.User.GetClient();
+        if (string.IsNullOrWhiteSpace(clientName))
+        {
+            return false;
+        }
+
+        var configured = Environment.GetEnvironmentVariable("LIDSLABS_SDR_LADDER_CLIENTS");
+        var tokens = string.IsNullOrWhiteSpace(configured)
+            ? new[] { "Swiftfin", "Neptune" }
+            : configured.Split(',', StringSplitOptions.RemoveEmptyEntries | StringSplitOptions.TrimEntries);
+
+        foreach (var token in tokens)
+        {
+            if (clientName.Contains(token, StringComparison.OrdinalIgnoreCase))
+            {
+                return true;
+            }
+        }
+
+        return false;
     }
 
     private StringBuilder AppendPlaylist(StringBuilder builder, StreamState state, string url, int bitrate, string? subtitleGroup)
