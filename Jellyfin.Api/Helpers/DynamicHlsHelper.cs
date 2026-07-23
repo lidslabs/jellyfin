@@ -268,6 +268,36 @@ public class DynamicHlsHelper
                 state.OutputVideoCodec = "copy";
             }
 
+            // lidslabs (v0.4.0 experiment): the HDR *passthrough transcode* path emits a
+            // single VIDEO-RANGE=PQ variant with no SDR companion. Apple AVPlayer (Swiftfin /
+            // Neptune AV) silently refuses to start such an HDR-only master -- it fetches the
+            // media playlist then never requests a segment (stalls with no error). Stock
+            // Jellyfin already provides an SDR entrance for HDR content, but only on the copy
+            // path (the IsCopyCodec guards above); our passthrough is a transcode
+            // (OutputVideoCodec = hevc), so it never got one. Add an H.264 (tonemapped SDR)
+            // companion so the master advertises an HDR+SDR ladder; on an HDR-capable display
+            // AVPlayer should commit to the master and still select the PQ variant. Uses a
+            // copy of the query so downstream (adaptive) variants are unaffected, and restores
+            // the real output codec. Copy + SDR-source paths are untouched.
+            if (EncodingHelper.IsHdrPassthroughMode(state)
+                && !EncodingHelper.IsCopyCodec(state.OutputVideoCodec))
+            {
+                var originalVideoCodec = state.OutputVideoCodec;
+                state.OutputVideoCodec = "h264";
+
+                var sdrPlaylistQuery = new Dictionary<string, Microsoft.Extensions.Primitives.StringValues>(playlistQuery);
+                sdrPlaylistQuery["VideoCodec"] = "h264";
+                sdrPlaylistQuery["AllowVideoStreamCopy"] = "false";
+
+                var sdrVideoUrl = Microsoft.AspNetCore.WebUtilities.QueryHelpers.AddQueryString(baseUrl, sdrPlaylistQuery);
+
+                // HACK: Use the same bitrate so that the client can choose by other attributes, such as color range.
+                AppendPlaylist(builder, state, sdrVideoUrl, totalBitrate, subtitleGroup);
+
+                // Restore the real (transcode) output codec.
+                state.OutputVideoCodec = originalVideoCodec;
+            }
+
             // Provide Level 5.0 entrance for backward compatibility.
             // e.g. Apple A10 chips refuse the master playlist containing SDR HEVC Main Level 5.1 video,
             // but in fact it is capable of playing videos up to Level 6.1.
