@@ -1672,16 +1672,22 @@ public class DynamicHlsController : BaseJellyfinApiController
                 Path.GetFileNameWithoutExtension(outputPath));
         }
 
-        // Timestamp handling. Jellyfin defaults to "-copyts -avoid_negative_ts disabled"
-        // for HLS seek accuracy. We use "make_zero" instead for HDR transcodes as a
-        // defense against negative-timestamp issues that surfaced when this build
-        // used fMP4 segments (fMP4 tfdt boxes are strictly unsigned; "disabled"
-        // could wrap negative and crash ExoPlayer). We're back on MPEG-TS now and
-        // TS has no tfdt box, so make_zero is largely defensive here - but it's
-        // also harmless and the safest value if delivery ever changes back.
-        var tsArgs = EncodingHelper.IsHdrPassthroughMode(state)
-            ? "-copyts -avoid_negative_ts make_zero"
-            : "-copyts -avoid_negative_ts disabled";
+        // Timestamp handling. Jellyfin uses "-copyts -avoid_negative_ts disabled"
+        // for HLS seek accuracy: on a seek transcode (-ss + -copyts) the segment's
+        // fMP4 tfdt (baseMediaDecodeTime) must stay at the seek offset so it matches
+        // where the media playlist places that segment (segment N at N*segLen).
+        //
+        // We previously special-cased HDR passthrough to "make_zero", added back when
+        // this build was briefly on fMP4 to defend against a negative-tfdt ExoPlayer
+        // crash, then left in place under the (now stale) assumption we had returned
+        // to MPEG-TS. We ship fMP4 today, and "make_zero" shifts the seek segment's
+        // tfdt to ~0 while the playlist still positions it at N*segLen -- that timeline
+        // mismatch makes strict players (Apple AVPlayer, mpv/Moonfin) stall on resume
+        // (accept the segment, never advance). Verified on dev: HDR resume produced a
+        // seek segment at ~0.125s for a playlist position of ~561s. From-start output
+        // is IDR-first with tfdt=0 under either value, so "disabled" does not
+        // reintroduce a negative tfdt. Use the stock value for HDR too.
+        var tsArgs = "-copyts -avoid_negative_ts disabled";
 
         return string.Format(
             CultureInfo.InvariantCulture,
