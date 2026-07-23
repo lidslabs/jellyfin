@@ -373,7 +373,16 @@ public static class StreamingHelpers
     /// <returns>The complete file path, including the folder, for the transcoding file.</returns>
     private static string GetOutputFilePath(StreamState state, string outputFileExtension, IServerConfigurationManager serverConfigurationManager, string? deviceId, string? playSessionId)
     {
-        var data = $"{state.MediaPath}-{state.UserAgent}-{deviceId!}-{playSessionId!}";
+        // lidslabs: include the resolved output codecs in the hash. A single play session can
+        // advertise more than one server-side transcode variant (e.g. the HDR-passthrough master
+        // carries an H.264 SDR companion rung so AVPlayer will start HDR playback). Those variants
+        // share MediaPath/UserAgent/DeviceId/PlaySessionId, so without the codec they hash to the
+        // same output path and clobber each other's fMP4 init segment (-1.mp4) — last writer wins,
+        // leaving the client an avcC init in front of hvcC segments (or vice versa): frozen/black
+        // video while stream-copied audio keeps playing. Keying on codec gives each variant its own
+        // init/segment files. Seeks within one codec still hash to the same base path, so warm-join
+        // and reuse are unaffected.
+        var data = $"{state.MediaPath}-{state.UserAgent}-{deviceId!}-{playSessionId!}-{state.OutputVideoCodec}-{state.OutputAudioCodec}";
 
         var filename = data.GetMD5().ToString("N", CultureInfo.InvariantCulture);
         var ext = outputFileExtension.ToLowerInvariant();
