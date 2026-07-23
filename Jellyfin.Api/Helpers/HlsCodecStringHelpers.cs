@@ -162,6 +162,11 @@ public static class HlsCodecStringHelpers
         // The h265 syntax is a bit of a mystery at the time this comment was written.
         // This is what I've found through various sources:
         // FORMAT: [codecTag].[profile].[constraint?].L[level * 30].[UNKNOWN]
+        // NOTE: the 'L' here is the Main-tier marker (general_tier_flag=0). This is the
+        // form Apple's own HDR HLS streams use and AVPlayer expects; lidslabs pins the
+        // NVENC HDR transcode to Main tier (EncodingHelper -tier:v main) so the bitstream
+        // matches this 'L'. Our transcode bitrates fit Main tier L5.1 (~40 Mbps), so High
+        // tier is never needed.
         StringBuilder result = new StringBuilder("hvc1", 16);
 
         if (string.Equals(profile, "main10", StringComparison.OrdinalIgnoreCase)
