@@ -183,13 +183,34 @@ public class MediaInfoController : BaseJellyfinApiController
         // never invents capability — LidslabsProfileClaimsHevc still requires the
         // client to advertise HEVC. Computed here (profile is resolved); the
         // TranscodingProfile rewrite happens below, once info.MediaSources exists.
-        // (Swiftfin is intentionally NOT force-HEVC — see the gate note above; the
-        // 2026-07-21 attempt to add it made HDR worse and was reverted.)
+        //
+        // lidslabs 2026-07-23: Swiftfin can also opt into force-HEVC, but NOT via the
+        // normal profile.Name CSV match (Swiftfin posts DeviceProfile.Name=null, so
+        // LidslabsClientMatches can never see it) — it rides the authenticated-client
+        // Swiftfin gate instead, enabled when "swiftfin" is listed in the same
+        // LIDSLABS_FORCE_HEVC_CLIENTS env. Why this matters: a DV P7 (DOVIWithEL)
+        // title Swiftfin transcodes otherwise falls to h264 + HDR->SDR tonemap
+        // (Swiftfin's hevc profile excludes the raw P7 range), losing HDR. Forcing
+        // HEVC makes it a clean, Apple-compliant HDR10-HEVC fMP4 stream (verified
+        // 2026-07-23: hvc1 + colr BT.2020/PQ + mdcv + clli, re-decodes error-free;
+        // the P7 EL block-addition notice is benign). Swiftfin already negotiates
+        // Container=mp4 so it needs no fMP4 force. CAVEAT: this is under device test —
+        // Neptune's sibling AVPlayer engine historically rejected VIDEO-RANGE=PQ and
+        // needed force-SDR, so Swiftfin's AVPlayer may too. Env-toggleable precisely
+        // so on/off can be A/B'd on one image; the earlier 0018 force-HEVC attempt
+        // also carried a DV-P7 EL-strip rework (now known unnecessary) that confounded
+        // its result.
+        var lidslabsSwiftfinForceHevc =
+            lidslabsSwiftfinClient
+            && (Environment.GetEnvironmentVariable("LIDSLABS_FORCE_HEVC_CLIENTS") ?? string.Empty)
+                .Contains("swiftfin", StringComparison.OrdinalIgnoreCase);
+
         var lidslabsForceHevcEligible =
             profile is not null
-            && LidslabsClientMatches(
-                profile.Name,
-                Environment.GetEnvironmentVariable("LIDSLABS_FORCE_HEVC_CLIENTS"))
+            && (LidslabsClientMatches(
+                    profile.Name,
+                    Environment.GetEnvironmentVariable("LIDSLABS_FORCE_HEVC_CLIENTS"))
+                || lidslabsSwiftfinForceHevc)
             && LidslabsProfileClaimsHevc(profile);
 
         // lidslabs v0.3: gate-decision diagnostic log. Logs at Debug, so it is
