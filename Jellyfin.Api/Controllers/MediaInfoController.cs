@@ -382,6 +382,59 @@ public class MediaInfoController : BaseJellyfinApiController
                     Request.HttpContext.GetNormalizedRemoteIP());
             }
 
+            // lidslabs v0.3.3: tag the transcode for the SDR companion rung. The
+            // HDR-passthrough master carries an H.264 SDR rung ONLY for Apple AVPlayer
+            // clients (they refuse an HDR-only master); every other client already worked
+            // without it and some regress with it (Moonfin spins up both rungs -> ~10s
+            // black at start). The allowlist is resolved HERE, not at the master.m3u8 GET:
+            // this is the only place both the client name (Swiftfin posts DeviceProfile.Name
+            // = null, so User.GetClient() is its only handle) AND DeviceProfile.Name (the
+            // only field separating Neptune AV from Trident — same client name + UA) are
+            // reliable. The master GET is ?ApiKey=-authenticated, where GetClient() does not
+            // resolve for AVPlayer clients. We append LidslabsSdrLadder=1 to the
+            // TranscodingUrl; DynamicHlsHelper reads that marker back (the client echoes the
+            // URL verbatim) and adds the rung. Default set swiftfin,neptune_av; Trident,
+            // Streamyfin, Moonfin, Android TV, web are excluded. Tunable via
+            // LIDSLABS_SDR_LADDER_CLIENTS.
+            var sdrLadderClients = Environment.GetEnvironmentVariable("LIDSLABS_SDR_LADDER_CLIENTS");
+            if (string.IsNullOrWhiteSpace(sdrLadderClients))
+            {
+                sdrLadderClients = "swiftfin,neptune_av";
+            }
+
+            var lidslabsSdrLadderEligible =
+                LidslabsClientMatches(profile.Name, sdrLadderClients)
+                || (lidslabsSwiftfinClient
+                    && sdrLadderClients.Contains("swiftfin", StringComparison.OrdinalIgnoreCase));
+
+            _logger.LogDebug(
+                "lidslabs.sdrLadder gate: profile={ProfileName}, client={Client}, clients={Clients}, eligible={Eligible}",
+                profile.Name,
+                User.GetClient(),
+                sdrLadderClients,
+                lidslabsSdrLadderEligible);
+
+            if (lidslabsSdrLadderEligible)
+            {
+                foreach (var mediaSource in info.MediaSources)
+                {
+                    if (string.IsNullOrEmpty(mediaSource.TranscodingUrl))
+                    {
+                        continue;
+                    }
+
+                    mediaSource.TranscodingUrl += mediaSource.TranscodingUrl.Contains('?', StringComparison.Ordinal)
+                        ? "&LidslabsSdrLadder=1"
+                        : "?LidslabsSdrLadder=1";
+
+                    _logger.LogInformation(
+                        "lidslabs: SDR-ladder marker added to TranscodingUrl for profile={ProfileName}, client={Client}, item={ItemId}",
+                        profile.Name,
+                        User.GetClient(),
+                        itemId);
+                }
+            }
+
             // lidslabs v0.3.2: describe the DELIVERED stream, not the source, for a
             // transcode of a DV/HDR source.
             // Jellyfin returns the source MediaStreams verbatim even when the source is

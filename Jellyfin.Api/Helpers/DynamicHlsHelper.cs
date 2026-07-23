@@ -268,6 +268,48 @@ public class DynamicHlsHelper
                 state.OutputVideoCodec = "copy";
             }
 
+            // lidslabs v0.3.3: the HDR *passthrough transcode* path emits a single
+            // VIDEO-RANGE=PQ variant with no SDR companion. Apple AVPlayer clients (Swiftfin,
+            // Neptune AV) silently refuse to start such an HDR-only master -- they fetch the
+            // media playlist then never request a segment (stall with no error). Stock
+            // Jellyfin already provides an SDR entrance for HDR content, but only on the copy
+            // path (the IsCopyCodec guards above); our passthrough is a transcode
+            // (OutputVideoCodec = hevc), so it never got one. Add an H.264 (tonemapped SDR)
+            // companion so the master advertises an HDR+SDR ladder; on an HDR-capable display
+            // AVPlayer commits to the master and (for capable builds) selects the PQ variant
+            // (verified: Swiftfin plays HDR from start/seek/resume; Neptune AV plays SDR).
+            //
+            // SCOPE (LidslabsSdrLadderRequested): fire ONLY when PlaybackInfo tagged this
+            // stream for the known-AVPlayer allowlist. Every other client already worked
+            // without the rung and pays a real cost if it gets one -- e.g. Moonfin eagerly
+            // spins up BOTH rungs at start, so two 1440p NVENC transcodes contend on CUDA init
+            // + source probe and starve the opening segments (~10 s black before it
+            // self-heals). Clients that play HDR natively (Trident), via mpv (Streamyfin), or
+            // that we have not characterised (Android TV, web) therefore get the clean
+            // HDR-only master. The decision is made at PlaybackInfo (MediaInfoController),
+            // where the client name AND DeviceProfile.Name are both reliable, and carried here
+            // as a TranscodingUrl marker; the master.m3u8 GET's ?ApiKey= auth makes
+            // User.GetClient() unreliable at this point, so we must not re-derive it here.
+            if (EncodingHelper.IsHdrPassthroughMode(state)
+                && !EncodingHelper.IsCopyCodec(state.OutputVideoCodec)
+                && LidslabsSdrLadderRequested())
+            {
+                var originalVideoCodec = state.OutputVideoCodec;
+                state.OutputVideoCodec = "h264";
+
+                var sdrPlaylistQuery = new Dictionary<string, Microsoft.Extensions.Primitives.StringValues>(playlistQuery);
+                sdrPlaylistQuery["VideoCodec"] = "h264";
+                sdrPlaylistQuery["AllowVideoStreamCopy"] = "false";
+
+                var sdrVideoUrl = Microsoft.AspNetCore.WebUtilities.QueryHelpers.AddQueryString(baseUrl, sdrPlaylistQuery);
+
+                // HACK: Use the same bitrate so that the client can choose by other attributes, such as color range.
+                AppendPlaylist(builder, state, sdrVideoUrl, totalBitrate, subtitleGroup);
+
+                // Restore the real (transcode) output codec.
+                state.OutputVideoCodec = originalVideoCodec;
+            }
+
             // Provide Level 5.0 entrance for backward compatibility.
             // e.g. Apple A10 chips refuse the master playlist containing SDR HEVC Main Level 5.1 video,
             // but in fact it is capable of playing videos up to Level 6.1.
@@ -322,6 +364,25 @@ public class DynamicHlsHelper
 
         return new FileContentResult(Encoding.UTF8.GetBytes(builder.ToString()), MimeTypes.GetMimeType("playlist.m3u8"));
     }
+
+    /// <summary>
+    /// lidslabs v0.3.3: whether the SDR companion rung was requested for this stream.
+    /// The rung exists solely to make Apple AVPlayer clients commit to an HDR master; every
+    /// other client already worked without it and some pay a real cost for it (see the call
+    /// site). The AVPlayer-client decision is made upstream at PlaybackInfo — the only place
+    /// where both the authenticated client name AND DeviceProfile.Name are reliable — which
+    /// tags the TranscodingUrl with LidslabsSdrLadder=1. We must NOT re-derive it here: the
+    /// master.m3u8 GET is authenticated by an ?ApiKey= query for AVPlayer clients, so
+    /// User.GetClient() does not reliably resolve the client at this point (it returned
+    /// nothing for Swiftfin while resolving for Neptune — the exact split that regressed).
+    /// Reading the marker the client echoes back is auth-independent and precise (Trident,
+    /// separable from Neptune AV only by DeviceProfile.Name, is correctly excluded upstream).
+    /// </summary>
+    private bool LidslabsSdrLadderRequested()
+        => string.Equals(
+            _httpContextAccessor.HttpContext?.Request.Query["LidslabsSdrLadder"].ToString(),
+            "1",
+            StringComparison.Ordinal);
 
     private StringBuilder AppendPlaylist(StringBuilder builder, StreamState state, string url, int bitrate, string? subtitleGroup)
     {
