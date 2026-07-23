@@ -2282,6 +2282,29 @@ namespace MediaBrowser.Controller.MediaEncoding
                 }
             }
 
+            // HDR passthrough: pin hevc_nvenc to Main tier at a deterministic level so the
+            // bitstream matches the static HLS CODECS string DynamicHlsHelper advertises
+            // (hvc1.2.4.L<level>.B0 -- Main tier 'L', the form Apple's own HDR streams use).
+            // NVENC otherwise picks tier AND level adaptively by bitrate: observed a 2160p
+            // ~16-19 Mbps HDR encode emit HIGH tier at general_level_idc=150 (L5.0), while
+            // the manifest advertises Main tier L5.1 (153). Apple AVPlayer (Swiftfin /
+            // Neptune AV) validates the advertised codec string against the init segment's
+            // hvcC and, on a mismatch, fetches the media playlist then silently refuses
+            // (never requests the init segment) -- playback fails even though the client
+            // direct-plays the same file (whose own hvcC carries the real values, no
+            // manifest to contradict). Force Main tier + the resolution-based level the
+            // manifest advertises (2160p -> L5.1, else L5.0). Our transcode bitrates fit
+            // Main tier L5.1 (~40 Mbps ceiling), so High tier is never needed and Main tier
+            // is the Apple-canonical choice. Forcing a level at/above NVENC's own pick is
+            // safe -- the "-level can fail NVENC" caveat is about levels too LOW for the
+            // content. Verified on dev: emits exactly hvc1.2.4.L153.B0.
+            if (IsHdrPassthroughMode(state)
+                && string.Equals(videoEncoder, "hevc_nvenc", StringComparison.OrdinalIgnoreCase))
+            {
+                var hdrLevelToken = (state.OutputHeight >= 2160 || state.OutputWidth >= 3840) ? "5.1" : "5";
+                param += " -tier:v main -level:v " + hdrLevelToken;
+            }
+
             var level = NormalizeTranscodingLevel(state, state.GetRequestedLevel(targetVideoCodec));
 
             if (!string.IsNullOrEmpty(level))
