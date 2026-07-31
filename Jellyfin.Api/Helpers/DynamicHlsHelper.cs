@@ -294,20 +294,71 @@ public class DynamicHlsHelper
                 && !EncodingHelper.IsCopyCodec(state.OutputVideoCodec)
                 && LidslabsSdrLadderRequested())
             {
+                // lidslabs v0.3.4: the SDR rung's CODEC is negotiated, not hardcoded.
+                //
+                // v0.3.3 always emitted H.264 here, copied from the stock SDR rung above
+                // (whose job is a maximum-compatibility entrance on the copy path). That was
+                // the wrong call for this rung: its audience is Apple AVPlayer clients, which
+                // decode HEVC natively. The result was that a device with no HDR display —
+                // e.g. an iPad 8, sRGB panel, no P3 — correctly self-selected the SDR rung and
+                // was thereby pinned to H.264 forever, losing ~40% efficiency on exactly the
+                // constrained links where it matters most. "No HDR display" must not imply
+                // "no HEVC".
+                //
+                // So: emit an HEVC SDR rung when the client's OWN echoed query says it asked
+                // for HEVC, else keep H.264 byte-identically. This is a swap, never an
+                // addition — two rungs total (PQ + SDR), because a third rung at the same
+                // BANDWIDTH would make the client's choice between two SDR variants
+                // undefined (see the same-bitrate HACK below).
+                //
+                // Everything needed is already in playlistQuery, which the client echoed back
+                // to us — no DeviceProfile access needed at this point (and none is reliable
+                // here; see LidslabsSdrLadderRequested).
                 var originalVideoCodec = state.OutputVideoCodec;
-                state.OutputVideoCodec = "h264";
+                var originalRangeType = state.BaseRequest.VideoRangeType;
+                var originalProfile = state.BaseRequest.Profile;
+
+                var sdrCodec = LidslabsSdrRungCodec(playlistQuery);
 
                 var sdrPlaylistQuery = new Dictionary<string, Microsoft.Extensions.Primitives.StringValues>(playlistQuery);
-                sdrPlaylistQuery["VideoCodec"] = "h264";
+                sdrPlaylistQuery["VideoCodec"] = sdrCodec;
                 sdrPlaylistQuery["AllowVideoStreamCopy"] = "false";
+
+                state.OutputVideoCodec = sdrCodec;
+
+                if (string.Equals(sdrCodec, "hevc", StringComparison.OrdinalIgnoreCase))
+                {
+                    // Ask for SDR explicitly. IsHdrPassthroughMode honours an all-SDR
+                    // requested range and drops to the stock tonemap path, so this single
+                    // switch flips BOTH the manifest (VIDEO-RANGE) and the ffmpeg filter
+                    // chain together — the invariant that gate was written to guarantee.
+                    // Without it, target codec "hevc" + an HDR source would re-enter
+                    // passthrough and this rung would be a duplicate of the PQ one.
+                    sdrPlaylistQuery["hevc-rangetype"] = "SDR";
+                    state.BaseRequest.VideoRangeType = "SDR";
+
+                    // Pin BOTH sides to Main. The tonemap emits yuv420p (8-bit), so the
+                    // bitstream is HEVC Main — but the client's own request carries
+                    // hevc-profile=main10 (from its "main|main 10" profile condition), which
+                    // GetOutputVideoCodecProfile would echo into CODECS as hvc1.2.4 (Main10).
+                    // Verified on device: declared Main10 while ffmpeg reported
+                    // "hevc (Main) ... bt709". AVPlayer refuses a CODECS/bitstream mismatch —
+                    // the same failure mode patch 0016 pinned tier/level for — so an
+                    // unpinned HEVC rung would have silently re-created the very -11850 this
+                    // ladder exists to prevent.
+                    sdrPlaylistQuery["hevc-profile"] = "main";
+                    state.BaseRequest.Profile = "main";
+                }
 
                 var sdrVideoUrl = Microsoft.AspNetCore.WebUtilities.QueryHelpers.AddQueryString(baseUrl, sdrPlaylistQuery);
 
                 // HACK: Use the same bitrate so that the client can choose by other attributes, such as color range.
                 AppendPlaylist(builder, state, sdrVideoUrl, totalBitrate, subtitleGroup);
 
-                // Restore the real (transcode) output codec.
+                // Restore the real (transcode) output codec and the request's range/profile.
                 state.OutputVideoCodec = originalVideoCodec;
+                state.BaseRequest.VideoRangeType = originalRangeType;
+                state.BaseRequest.Profile = originalProfile;
             }
 
             // Provide Level 5.0 entrance for backward compatibility.
@@ -383,6 +434,62 @@ public class DynamicHlsHelper
             _httpContextAccessor.HttpContext?.Request.Query["LidslabsSdrLadder"].ToString(),
             "1",
             StringComparison.Ordinal);
+
+    /// <summary>
+    /// lidslabs v0.3.4: which video codec the SDR companion rung should carry.
+    /// <para>
+    /// Returns "hevc" when the client asked for HEVC and can take it as SDR, else "h264".
+    /// The decision is made purely from the playlist query the client echoed back, because
+    /// that IS the client's own negotiated request — StreamBuilder already reduced its
+    /// DeviceProfile to these parameters at PlaybackInfo, and the DeviceProfile itself is
+    /// not reachable here (see LidslabsSdrLadderRequested for why client identity is
+    /// unreliable at this point).
+    /// </para>
+    /// <para>
+    /// Three conditions, all of which must hold. (1) VideoCodec lists hevc — the client
+    /// asked for it. (2) The hevc range list includes SDR, or is absent entirely; a client
+    /// that explicitly restricted hevc to HDR-only ranges must not be handed HEVC SDR.
+    /// (3) The segment container is fMP4. This one is not optional: Apple AVPlayer cannot
+    /// decode HEVC in MPEG-TS (it renders static — the finding behind patch 0007's fMP4
+    /// force), and this rung's entire audience is AVPlayer clients. A ts-segmented ladder
+    /// therefore keeps H.264.
+    /// </para>
+    /// </summary>
+    /// <param name="playlistQuery">The query the client echoed back on the master request.</param>
+    /// <returns>"hevc" or "h264".</returns>
+    private static string LidslabsSdrRungCodec(
+        IDictionary<string, Microsoft.Extensions.Primitives.StringValues> playlistQuery)
+    {
+        const string Fallback = "h264";
+
+        static string[] SplitCsv(Microsoft.Extensions.Primitives.StringValues value)
+            => value.ToString().Split(',', StringSplitOptions.RemoveEmptyEntries | StringSplitOptions.TrimEntries);
+
+        if (!playlistQuery.TryGetValue("VideoCodec", out var requestedCodecs)
+            || !SplitCsv(requestedCodecs).Contains("hevc", StringComparer.OrdinalIgnoreCase))
+        {
+            return Fallback;
+        }
+
+        // An explicit hevc range list that excludes SDR means "HEVC only for HDR".
+        // Absent = unconstrained = SDR is acceptable.
+        if (playlistQuery.TryGetValue("hevc-rangetype", out var hevcRangeTypes))
+        {
+            var ranges = SplitCsv(hevcRangeTypes);
+            if (ranges.Length > 0 && !ranges.Contains("SDR", StringComparer.OrdinalIgnoreCase))
+            {
+                return Fallback;
+            }
+        }
+
+        if (!playlistQuery.TryGetValue("SegmentContainer", out var segmentContainer)
+            || !string.Equals(segmentContainer.ToString(), "mp4", StringComparison.OrdinalIgnoreCase))
+        {
+            return Fallback;
+        }
+
+        return "hevc";
+    }
 
     private StringBuilder AppendPlaylist(StringBuilder builder, StreamState state, string url, int bitrate, string? subtitleGroup)
     {
