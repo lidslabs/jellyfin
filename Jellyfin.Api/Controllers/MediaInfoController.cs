@@ -341,15 +341,34 @@ public class MediaInfoController : BaseJellyfinApiController
             // Neptune build that reverts its transcode container to ts, and to keep
             // the AV Player path symmetric with Swiftfin. General rule: force fMP4
             // whenever an Apple-TV AVPlayer client is forced to transcode over HLS.
-            // Second AVPlayer adopter after Swiftfin; a third should promote both
-            // call-sites to a shared code path (see FUTURE_REQUESTS.md).
+            //
+            // lidslabs v0.3.4 (patch 0023): PROMOTED TO A SHARED CODE PATH, as the note
+            // above instructed once a third adopter appeared. That adopter is the
+            // iPhone/iPad app, and for it this is the FIX, not insurance.
+            //
+            // Why it matters here: the app ships defaulting to its default player AND
+            // MPEG-TS, and in that configuration it posts exactly ONE video HLS
+            // TranscodingProfile — Container=ts, VideoCodec="h264". It offers hevc only on
+            // the mp4 profile it posts when the user turns fMP4 on, which is three separate
+            // settings deep. So an out-of-the-box install never asks for HEVC, never reaches
+            // the HDR-passthrough path, and never sees the SDR ladder at all: it silently
+            // gets H.264 forever on hardware that decodes HEVC in fixed function.
+            //
+            // Forcing the container alone would NOT fix that — LidslabsForceFmp4Hls touches
+            // Container only, so a ts/h264 profile would become mp4/h264 and still deliver
+            // H.264 (verified on dev). The codec force is what adds hevc; this transport
+            // force is what makes the result playable, because AVPlayer cannot decode
+            // HEVC-in-mpegts (patch 0007's finding — it renders static). The two are a
+            // matched pair and neither is useful alone, which is why both hang off the same
+            // LIDSLABS_FORCE_HEVC_CLIENTS opt-in and no new env var is introduced.
             if (lidslabsForceHevcEligible
-                && LidslabsClientMatches(profile.Name, "neptune_av")
+                && LidslabsIsApplePlayerClient(profile.Name, User.GetClient())
                 && LidslabsForceFmp4Hls(profile))
             {
                 _logger.LogInformation(
-                    "lidslabs: Neptune AV Player fMP4 HLS force applied (video TranscodingProfile container -> mp4) for profile={ProfileName}, item={ItemId}",
+                    "lidslabs: AVPlayer fMP4 HLS force applied (video TranscodingProfile container -> mp4) for profile={ProfileName}, client={Client}, item={ItemId}",
                     profile.Name,
+                    User.GetClient(),
                     itemId);
             }
 
@@ -764,6 +783,22 @@ public class MediaInfoController : BaseJellyfinApiController
         // video profiles only — progressive/http and audio profiles are
         // untouched. Reusable: a future Apple-TV AVPlayer client (e.g. Neptune
         // AV Player) can call this from its own gate without re-deriving it.
+        // lidslabs v0.3.4 (patch 0023): the single source of truth for "this client renders
+        // through Apple AVPlayer", which is the class that cannot decode HEVC (or any
+        // non-H.264 codec) inside MPEG-TS and must be served fMP4/CMAF instead.
+        //
+        // Covers both identity namespaces, because the members are split across them:
+        // Neptune's AV Player mode is only separable from Trident by DeviceProfile.Name,
+        // while the Apple TV and iPhone/iPad apps are only reliably identified by the
+        // authenticated client name. See LidslabsClientMatches / LidslabsClientNameMatches.
+        //
+        // Deliberately NOT env-driven: this is a statement about a renderer's decoding
+        // limits, not a per-deployment preference. It only ever takes effect where a codec
+        // force already fired, so it cannot change any client's transport on its own.
+        static bool LidslabsIsApplePlayerClient(string? profileName, string? clientName)
+            => LidslabsClientMatches(profileName, "neptune_av")
+               || LidslabsClientNameMatches(clientName, "swiftfin,jellyfin_ios");
+
         static bool LidslabsForceFmp4Hls(DeviceProfile p)
         {
             var changed = false;
