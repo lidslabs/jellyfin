@@ -202,17 +202,23 @@ public class MediaInfoController : BaseJellyfinApiController
         // forced-HEVC on/off can still be A/B'd on one image; the earlier 0018
         // force-HEVC attempt also carried a DV-P7 EL-strip rework (now known
         // unnecessary) that confounded its result.
-        var lidslabsSwiftfinForceHevc =
-            lidslabsSwiftfinClient
-            && (Environment.GetEnvironmentVariable("LIDSLABS_FORCE_HEVC_CLIENTS") ?? string.Empty)
-                .Contains("swiftfin", StringComparison.OrdinalIgnoreCase);
+        //
+        // lidslabs v0.3.4: the Swiftfin-specific arm is folded into the shared
+        // client-name matcher (LidslabsClientNameMatches), which resolves the SAME
+        // friendly-name CSV against the authenticated client string instead of
+        // DeviceProfile.Name. "swiftfin" keeps its exact meaning — the tvOS client — and
+        // the check is now a proper CSV split rather than a raw substring scan of the env
+        // value (the old form would also have matched a hypothetical "not-swiftfin"
+        // entry). The iPhone/iPad app gains "jellyfin_ios" as an opt-in on the same lever;
+        // it is deliberately NOT in any default, because whether forcing HEVC is right
+        // depends on the DEVICE's display, not the app (an iPad 8 has no HDR display at
+        // all — see the neptune arm note in LidslabsClientMatches).
+        var lidslabsForceHevcClients = Environment.GetEnvironmentVariable("LIDSLABS_FORCE_HEVC_CLIENTS");
 
         var lidslabsForceHevcEligible =
             profile is not null
-            && (LidslabsClientMatches(
-                    profile.Name,
-                    Environment.GetEnvironmentVariable("LIDSLABS_FORCE_HEVC_CLIENTS"))
-                || lidslabsSwiftfinForceHevc)
+            && (LidslabsClientMatches(profile.Name, lidslabsForceHevcClients)
+                || LidslabsClientNameMatches(User.GetClient(), lidslabsForceHevcClients))
             && LidslabsProfileClaimsHevc(profile);
 
         // lidslabs v0.3: gate-decision diagnostic log. Logs at Debug, so it is
@@ -222,16 +228,26 @@ public class MediaInfoController : BaseJellyfinApiController
         // gate inputs (profile name, configured client list, HEVC capability)
         // and the eligibility result. See DECISIONS.md, "Diagnostic logging at
         // the eligibility point".
-        _logger.LogDebug(
-            "lidslabs.forceHevc gate: profile={ProfileName}, clients={Clients}, profileHevc={ProfileHevc}, eligible={Eligible}",
+        // lidslabs v0.3.4: RAISED Debug -> Information, and the client string added to the
+        // payload. Rationale (a deliberate, narrow exception to the Debug convention
+        // above): every client gate in this file keys off a vendor-supplied string that
+        // moves without notice — the tvOS 1.5 rename broke three corrections silently
+        // (patch 0017), and the v0.3.4 SDR-ladder bug shipped to prod and survived a full
+        // release because a gate that never fired looked identical, in an
+        // Information-level log, to a gate that had no work to do. One line per playback
+        // start makes the NEGATIVE case visible, which is the case that actually costs us.
+        // The other lidslabs gates stay at Debug; only the two client-identity gates are
+        // promoted. See DECISIONS.md, "Diagnostic logging at the eligibility point".
+        _logger.LogInformation(
+            "lidslabs.forceHevc gate: profile={ProfileName}, client={Client}, clients={Clients}, profileHevc={ProfileHevc}, eligible={Eligible}",
             profile?.Name,
-            Environment.GetEnvironmentVariable("LIDSLABS_FORCE_HEVC_CLIENTS"),
+            User.GetClient(),
+            lidslabsForceHevcClients,
             profile is not null && LidslabsProfileClaimsHevc(profile),
             lidslabsForceHevcEligible);
 
-        // Swiftfin gate diagnostic (Debug; dormant at Information level). Raise the
-        // level to Debug to confirm "is this request seen as Swiftfin?" in one
-        // cycle.
+        // Swiftfin (Apple TV) gate diagnostic — retained as the anchor for the pending
+        // per-engine work; see the gate's own comment above.
         _logger.LogDebug(
             "lidslabs.swiftfin gate: client={Client}, eligible={Eligible}",
             User.GetClient(),
@@ -393,21 +409,40 @@ public class MediaInfoController : BaseJellyfinApiController
             // reliable. The master GET is ?ApiKey=-authenticated, where GetClient() does not
             // resolve for AVPlayer clients. We append LidslabsSdrLadder=1 to the
             // TranscodingUrl; DynamicHlsHelper reads that marker back (the client echoes the
-            // URL verbatim) and adds the rung. Default set swiftfin,neptune_av; Trident,
-            // Streamyfin, Moonfin, Android TV, web are excluded. Tunable via
+            // URL verbatim) and adds the rung. Default set swiftfin,neptune_av,jellyfin_ios;
+            // Trident, Streamyfin, Moonfin, Android TV, web are excluded. Tunable via
             // LIDSLABS_SDR_LADDER_CLIENTS.
+            //
+            // lidslabs v0.3.4: jellyfin_ios ADDED to the default set, and the client-name
+            // half of the match generalised (LidslabsClientNameMatches). v0.3.3 shipped the
+            // rung with a default of "swiftfin,neptune_av" resolved through
+            // LidslabsClientMatches(profile.Name, ...) plus a hardcoded "Swiftfin tvOS"
+            // client check — and "swiftfin" has never had a profile.Name arm, so the ONLY
+            // way the rung could ever fire was the tvOS client string. Every iOS client
+            // therefore fell through to the bare HDR-only master this rung exists to
+            // prevent, and prod logs confirm it: zero "SDR-ladder marker added" lines
+            // across the whole fleet since v0.3.3 deployed. Symptom on the Jellyfin iPadOS
+            // app was total playback failure on any HDR source that reached the HEVC
+            // passthrough path, surfacing on its Native player as AVFoundation -11850
+            // (AVErrorServerIncorrectlyConfigured — "no variant in this master is playable
+            // for me"). DEBUG_LOG 2026-07-30.
             var sdrLadderClients = Environment.GetEnvironmentVariable("LIDSLABS_SDR_LADDER_CLIENTS");
             if (string.IsNullOrWhiteSpace(sdrLadderClients))
             {
-                sdrLadderClients = "swiftfin,neptune_av";
+                sdrLadderClients = "swiftfin,neptune_av,jellyfin_ios";
             }
 
+            // lidslabs v0.3.4: match on the authenticated CLIENT NAME as well as
+            // DeviceProfile.Name. The Jellyfin iOS/iPadOS app is the case that forced this:
+            // its two player engines post different DeviceProfile.Names (the default engine
+            // posts null, the Native/AVPlayer engine posts an app-supplied name), so no
+            // profile-name rule can cover the app as a unit — but both engines authenticate
+            // under one stable client string. See LidslabsClientNameMatches.
             var lidslabsSdrLadderEligible =
                 LidslabsClientMatches(profile.Name, sdrLadderClients)
-                || (lidslabsSwiftfinClient
-                    && sdrLadderClients.Contains("swiftfin", StringComparison.OrdinalIgnoreCase));
+                || LidslabsClientNameMatches(User.GetClient(), sdrLadderClients);
 
-            _logger.LogDebug(
+            _logger.LogInformation(
                 "lidslabs.sdrLadder gate: profile={ProfileName}, client={Client}, clients={Clients}, eligible={Eligible}",
                 profile.Name,
                 User.GetClient(),
@@ -566,7 +601,27 @@ public class MediaInfoController : BaseJellyfinApiController
             {
                 var matched = friendly.ToLowerInvariant() switch
                 {
-                    "neptune" => profileName.Contains("Trident", StringComparison.OrdinalIgnoreCase),
+                    // lidslabs v0.3.4: SCOPED TO tvOS. This arm used to be a bare
+                    //     Contains("Trident"), which was correct while Trident shipped
+                    //     only on Apple TV. Neptune's iOS app posts
+                    //     "Neptune iOS (Trident)" and so inherited an Apple-TV-tuned
+                    //     lever: on an iPad 8 (no HDR display, see below) the forced
+                    //     HEVC transcode came out 3840x2160 HDR10 @ 19.4 Mbps with audio
+                    //     copy, which the device renders untone-mapped and then stalls
+                    //     on. Requiring "Neptune tvOS" keeps the Apple TV behavior
+                    //     byte-identical and drops iOS back to its own negotiated codec.
+                    //     iOS can opt in separately via the "neptune_ios" arm below.
+                    //     DEBUG_LOG 2026-07-30.
+                    "neptune" => profileName.Contains("Neptune tvOS", StringComparison.OrdinalIgnoreCase)
+                                 && profileName.Contains("Trident", StringComparison.OrdinalIgnoreCase),
+                    // lidslabs v0.3.4: Neptune's iOS/iPadOS app. Trident is its only
+                    //     player engine (confirmed 2026-07-30 — the app ships no AV
+                    //     Player mode), so one arm covers the app. NOT in any
+                    //     default client list: forcing HEVC here is only right for an
+                    //     HDR-capable iOS device, which is a per-device call, not a
+                    //     per-app one. Opt in by adding "neptune_ios" to
+                    //     LIDSLABS_FORCE_HEVC_CLIENTS.
+                    "neptune_ios" => profileName.Contains("Neptune iOS", StringComparison.OrdinalIgnoreCase),
                     "streamyfin" => profileName.Contains("1. MPV", StringComparison.OrdinalIgnoreCase),
                     // lidslabs v0.3.2 (patch 0009): Neptune AV Player — the app's
                     //     Apple-AVPlayer player mode. Name "Neptune tvOS" is a strict
@@ -586,6 +641,62 @@ public class MediaInfoController : BaseJellyfinApiController
                     //     HDR passthrough correctly on dev — no special-casing needed. If
                     //     the washout ever returns, re-add the arm; the history is in
                     //     DEBUG_LOG.md 2026-07-04 and .project/moonfin-hdr-mpv-washout-issue.md.
+                    _ => false,
+                };
+
+                if (matched)
+                {
+                    return true;
+                }
+            }
+
+            return false;
+        }
+
+        // lidslabs v0.3.4: the CLIENT-NAME half of the friendly-name matcher.
+        //
+        // LidslabsClientMatches keys on DeviceProfile.Name, which distinguishes player
+        // MODES that ship inside one app (Neptune's Trident vs AV Player post different
+        // names under the same client string and UA). That is the right handle there, but
+        // it cannot address an app whose engines post different profile names — or none.
+        //
+        // The Jellyfin iOS/iPadOS app is exactly that case, and is why the v0.3.3 SDR
+        // companion rung never fired for it in production: its default player posts
+        // DeviceProfile.Name = null while its Native (AVPlayer) player posts an
+        // app-supplied name, so neither a null check nor any name substring covers the app
+        // as a unit. Both engines do authenticate under one stable client string, which is
+        // reliable HERE (PlaybackInfo is bearer-authenticated; the later master.m3u8 GET is
+        // ?ApiKey=-authenticated, where User.GetClient() does not resolve — that asymmetry
+        // is precisely why the ladder decision is made at PlaybackInfo and carried as a
+        // TranscodingUrl marker).
+        //
+        // Client strings are EXACT matches, not substrings: "Jellyfin iOS" is a strict
+        // prefix of nothing today, but the tvOS app's 1.5 rename from "Jellyfin tvOS" to
+        // "Swiftfin tvOS" (patch 0017) is the standing proof that these strings move, and a
+        // substring rule would silently widen when they do. An unmapped friendly name
+        // returns false, same contract as LidslabsClientMatches.
+        static bool LidslabsClientNameMatches(string? clientName, string? csv)
+        {
+            if (string.IsNullOrWhiteSpace(clientName) || string.IsNullOrWhiteSpace(csv))
+            {
+                return false;
+            }
+
+            foreach (var friendly in LidslabsSplitTrim(csv))
+            {
+                var matched = friendly.ToLowerInvariant() switch
+                {
+                    // The Apple TV app (App Store name "Swiftfin"). Renamed from
+                    //     "Jellyfin tvOS" in its 1.5 release — patch 0017.
+                    "swiftfin" => string.Equals(clientName, "Swiftfin tvOS", StringComparison.OrdinalIgnoreCase),
+                    // lidslabs v0.3.4: the iPhone/iPad app (App Store name "Jellyfin" —
+                    //     there is no "Swiftfin" listing on iOS). It reports
+                    //     "Jellyfin " + the OS name, so iPhone and iPad authenticate under
+                    //     DIFFERENT strings; both are listed. Confirmed against a live
+                    //     server (app 1.7.0): "Jellyfin iPadOS" reported by an iPad,
+                    //     "Jellyfin iOS" by an iPhone. DEBUG_LOG 2026-07-30.
+                    "jellyfin_ios" => string.Equals(clientName, "Jellyfin iOS", StringComparison.OrdinalIgnoreCase)
+                                      || string.Equals(clientName, "Jellyfin iPadOS", StringComparison.OrdinalIgnoreCase),
                     _ => false,
                 };
 
