@@ -134,10 +134,25 @@ namespace MediaBrowser.Controller.MediaEncoding
 
         // Set max transcoding channels for encoders that can't handle more than a set amount of channels
         // AAC, FLAC, ALAC, libopus, libvorbis encoders all support at least 8 channels
+        //
+        // lidslabs v0.4.0: the { "libfdk_aac", 6 } entry that used to sit here has been
+        // REMOVED, so libfdk_aac now falls through to the default limit of 8 below.
+        // It sat directly under the comment above stating AAC supports at least 8, and it
+        // was the sole reason every AAC transcode on this server was folded to 5.1 — the
+        // observed `libfdk_aac -ac 6` came from this line, not from the encoder.
+        // Measured against jellyfin-ffmpeg 7.1.4 (the build that performs every transcode
+        // here): libfdk_aac encodes 8 discrete channels, channel_layout=7.1, AAC-LC, with
+        // per-channel correlation 0.9997-0.9998 against the source at 512k-1152k. The
+        // earlier "libfdk is broken at 8 channels / emits SL+SR as digital silence"
+        // finding was measured on a HOST ffmpeg that has no libfdk_aac compiled in at all,
+        // so it tested an absent encoder. See scripts/atmos/DECISIONS.md D51.
+        //
+        // This matters more than a channel count: 5.1 measures 11-16 dB from the 7.1
+        // source at ANY bitrate, because the fold itself is the loss. Channel count
+        // dominates bitrate here.
         private static readonly Dictionary<string, int> _audioTranscodeChannelLookup = new(StringComparer.OrdinalIgnoreCase)
         {
             { "libmp3lame", 2 },
-            { "libfdk_aac", 6 },
             { "ac3", 6 },
             { "eac3", 6 },
             { "dca", 6 },
@@ -2823,12 +2838,39 @@ namespace MediaBrowser.Controller.MediaEncoding
             var outputChannels = outputAudioChannels ?? 0;
             var bitrate = audioBitRate ?? int.MaxValue;
 
+            // lidslabs v0.4.0: AAC/Opus/Vorbis/MP3 split out of the AC-3 group.
+            //
+            // Upstream lumps all seven codecs together and gives the multichannel case a
+            // flat 640 kbps ceiling. For AC-3 that ceiling is correct — 640 kbps is the
+            // format's spec maximum — and for ffmpeg's E-AC-3 it is harmless, because that
+            // encoder measures flat from 640k to 1536k (26.8 -> 26.9 dB over 2.4x the
+            // rate). For AAC and Opus it is simply wrong: neither has any such limit, and
+            // the shared ceiling silently held 7.1 AAC to 80 kbps/channel.
+            //
+            // Measured on loud, wideband, transient-dense 7.1 content, libfdk_aac gains
+            // ~2.4 dB mean SNR going from 960k to 1152k and does not saturate below it,
+            // so 144 kbps/channel (8ch -> 1152k, 6ch -> 864k) is the useful target rather
+            // than an arbitrary one. Stays a Math.Min, so an explicit lower request from
+            // the client or the operator still wins.
+            //
+            // See scripts/atmos/DECISIONS.md D52.
             if (string.IsNullOrEmpty(audioCodec)
                 || string.Equals(audioCodec, "aac", StringComparison.OrdinalIgnoreCase)
                 || string.Equals(audioCodec, "mp3", StringComparison.OrdinalIgnoreCase)
                 || string.Equals(audioCodec, "opus", StringComparison.OrdinalIgnoreCase)
-                || string.Equals(audioCodec, "vorbis", StringComparison.OrdinalIgnoreCase)
-                || string.Equals(audioCodec, "ac3", StringComparison.OrdinalIgnoreCase)
+                || string.Equals(audioCodec, "vorbis", StringComparison.OrdinalIgnoreCase))
+            {
+                return (inputChannels, outputChannels) switch
+                {
+                    (>= 6, >= 6) => Math.Min(outputChannels * 144000, bitrate),
+                    (>= 6, 0) => Math.Min(inputChannels * 144000, bitrate),
+                    (> 0, > 0) => Math.Min(outputChannels * 128000, bitrate),
+                    (> 0, _) => Math.Min(inputChannels * 128000, bitrate),
+                    (_, _) => Math.Min(384000, bitrate)
+                };
+            }
+
+            if (string.Equals(audioCodec, "ac3", StringComparison.OrdinalIgnoreCase)
                 || string.Equals(audioCodec, "eac3", StringComparison.OrdinalIgnoreCase))
             {
                 return (inputChannels, outputChannels) switch
@@ -2856,6 +2898,152 @@ namespace MediaBrowser.Controller.MediaEncoding
             // Default audio bitrate to 128K per channel if we don't have codec specific defaults
             // https://ffmpeg.org/ffmpeg-codecs.html#toc-Codec-Options
             return 128000 * (outputAudioChannels ?? audioStream.Channels ?? 2);
+        }
+
+        /// <summary>
+        /// Default audio delivery ladder (lidslabs v0.4.0).
+        /// </summary>
+        /// <remarks>
+        /// Note the absence of a rate on <c>aac</c>. The useful target is a per-channel rate —
+        /// 144 kbps/channel, which is where libfdk_aac stops improving on loud wideband 7.1
+        /// content — and that is already the default in both GetDefaultAudioBitrate and
+        /// GetAudioBitrateParam, so it is derived from the negotiated channel count (8ch ->
+        /// 1152k, 6ch -> 864k) and then clamped against the session's total bitrate budget.
+        /// Writing an absolute "@1152k" here would be correct for 7.1 and silently wrong for
+        /// every other layout, so a rate is accepted as an operator override but is not the
+        /// normal way to use this lever.
+        /// <para>
+        /// The ladder stops at <c>sidecar</c> deliberately: every rung that could sit below it
+        /// measured worse than simply letting Jellyfin negotiate unaided.
+        /// </para>
+        /// </remarks>
+        private const string LidslabsDefaultAudioLadder = "copy,aac,sidecar";
+
+        /// <summary>
+        /// Resolves the highest-ranked transcode rung the client will actually accept.
+        /// </summary>
+        /// <param name="state">The job.</param>
+        /// <returns>The winning rung, or <c>null</c> when no transcode rung is reachable.</returns>
+        /// <remarks>
+        /// <para>
+        /// Rung order comes from LIDSLABS_AUDIO_PREFERRED_CODEC. Only the transcode rungs are
+        /// resolved here, because they are the only ones this method has to choose between:
+        /// <c>copy</c> is Jellyfin's own first move (TryStreamCopy runs later and judges
+        /// whatever stream is still selected), and <c>sidecar</c> is the caller's decision —
+        /// it fires precisely when this returns null.
+        /// </para>
+        /// <para>
+        /// Rungs ranked BELOW <c>sidecar</c> are not considered: the ladder is ordered, so a
+        /// codec the operator placed under the sidecar must not pre-empt it.
+        /// </para>
+        /// <para>
+        /// Availability is POSITIVE evidence only. For HLS segment requests StreamBuilder has
+        /// already narrowed SupportedAudioCodecs to the single codec it intends to use, so a
+        /// codec's absence proves nothing — but its presence is real evidence the client
+        /// accepts it. Patch 0003's comment forbids gating on this list; that warning is about
+        /// the false-negative direction, which this does not rely on.
+        /// </para>
+        /// </remarks>
+        private LidslabsAudioRung LidslabsResolveAudioRung(EncodingJobInfo state)
+        {
+            var rungs = LidslabsEnv.List(LidslabsEnv.PreferredAudioCodec, LidslabsDefaultAudioLadder);
+
+            foreach (var entry in rungs)
+            {
+                if (string.Equals(entry, "sidecar", StringComparison.OrdinalIgnoreCase))
+                {
+                    // Anything below the sidecar loses to it by construction.
+                    return null;
+                }
+
+                if (string.Equals(entry, "copy", StringComparison.OrdinalIgnoreCase))
+                {
+                    continue;
+                }
+
+                // "<codec>" or "<codec>@<rate>", where rate accepts a k/m suffix.
+                var at = entry.IndexOf('@', StringComparison.Ordinal);
+                var codec = at < 0 ? entry : entry[..at];
+                var rateText = at < 0 ? string.Empty : entry[(at + 1)..];
+
+                if (codec.Length == 0
+                    || state.SupportedAudioCodecs is null
+                    || !state.SupportedAudioCodecs.Contains(codec, StringComparer.OrdinalIgnoreCase)
+                    || !_mediaEncoder.CanEncodeToAudioCodec(codec))
+                {
+                    continue;
+                }
+
+                return new LidslabsAudioRung(codec, LidslabsParseBitrate(rateText));
+            }
+
+            return null;
+        }
+
+        /// <summary>
+        /// Parses an optional ladder rate such as "1152k" or "640000".
+        /// </summary>
+        /// <param name="text">The rate text, possibly empty.</param>
+        /// <returns>Bits per second, or <c>null</c> when absent or unparseable.</returns>
+        private static int? LidslabsParseBitrate(string text)
+        {
+            if (string.IsNullOrEmpty(text))
+            {
+                return null;
+            }
+
+            var multiplier = 1;
+            var digits = text;
+
+            if (digits.EndsWith('k') || digits.EndsWith('K'))
+            {
+                multiplier = 1000;
+                digits = digits[..^1];
+            }
+            else if (digits.EndsWith('m') || digits.EndsWith('M'))
+            {
+                multiplier = 1000000;
+                digits = digits[..^1];
+            }
+
+            if (!int.TryParse(digits, NumberStyles.Integer, CultureInfo.InvariantCulture, out var value)
+                || value <= 0)
+            {
+                return null;
+            }
+
+            return value > int.MaxValue / multiplier ? null : value * multiplier;
+        }
+
+        /// <summary>
+        /// A resolved transcode rung from the audio ladder (lidslabs v0.4.0).
+        /// </summary>
+        /// <param name="Codec">The output audio codec.</param>
+        /// <param name="Bitrate">An explicit operator ceiling in bits per second, or null to derive it per channel.</param>
+        private sealed record LidslabsAudioRung(string Codec, int? Bitrate);
+
+        /// <summary>
+        /// Encoder-specific quality flags that ffmpeg's defaults get wrong for our targets (lidslabs v0.4.0).
+        /// </summary>
+        /// <param name="encoder">The resolved ffmpeg encoder name, not the output codec name.</param>
+        /// <returns>Extra arguments, leading space included, or an empty string.</returns>
+        /// <remarks>
+        /// libfdk_aac applies a hard 17.0 kHz lowpass by default, at EVERY bitrate, independent of
+        /// content — and Jellyfin prefers libfdk whenever the build has it (see GetAudioEncoder)
+        /// while never setting -cutoff. The result was that every AAC transcode this server has ever
+        /// produced lost everything above 17 kHz for no bitrate saving. Measured on real content:
+        /// -cutoff 20000 moves the front-channel spectral edge from 17.0 kHz to 19.7 kHz (source:
+        /// 20.0 kHz) and costs =0.4 dB SNR at 1152k. 20000 is fdk's documented ceiling; asking for
+        /// 22050 is rejected outright ("cutoff valid range is 188-20000").
+        /// </remarks>
+        internal static string GetLidslabsAudioEncoderQualityParams(string encoder)
+        {
+            if (string.Equals(encoder, "libfdk_aac", StringComparison.OrdinalIgnoreCase))
+            {
+                return " -cutoff 20000";
+            }
+
+            return string.Empty;
         }
 
         public string GetAudioVbrModeParam(string encoder, int bitrate, int channels)
@@ -7764,7 +7952,44 @@ namespace MediaBrowser.Controller.MediaEncoding
                         || string.Equals(originalCodec, "mlp", StringComparison.OrdinalIgnoreCase)
                         || string.Equals(originalCodec, "dts", StringComparison.OrdinalIgnoreCase);
 
-                    if (isProblematicLosslessSource)
+                    // ========================================================
+                    // lidslabs v0.4.0: the redirect is now a RUNG, not a pre-pass.
+                    // ========================================================
+                    // As written in v0.3 this block ran unconditionally and mutated
+                    // state.AudioStream inside AttachMediaSourceInfo — which always
+                    // executes BEFORE TryStreamCopy (StreamingHelpers 161 -> 207;
+                    // TranscodeManager 771 -> 775). So on every TrueHD title carrying a
+                    // compatibility track (98% of this library) the lossless stream was
+                    // discarded before any other decision was made, with two consequences:
+                    //
+                    //   * CanStreamCopyAudio then judged the AC-3 track, answered yes, and
+                    //     set OutputAudioCodec = "copy" — delivering 640 kbps AC-3 5.1
+                    //     while the logs read as a clean lossless passthrough; and
+                    //   * when the client could not take AC-3 either, the transcode ran
+                    //     FROM the 640 kbps sidecar rather than from the lossless source —
+                    //     a lossy-to-lossy cascade, at 5.1, with the TrueHD sitting right
+                    //     there in the same file.
+                    //
+                    // The intended order is copy -> transcode -> sidecar. Every rung above
+                    // "sidecar" needs the ORIGINAL stream to still be selected, so the
+                    // redirect must fire only once those rungs are unavailable.
+                    //
+                    // The test is deliberately POSITIVE evidence only. state.SupportedAudioCodecs
+                    // carries what was requested, and for HLS segment requests StreamBuilder
+                    // has already narrowed it to the single codec it intends to transcode to
+                    // — so absence of a codec proves nothing (that false negative is exactly
+                    // why the v0.3 comment below refuses to gate on this list), but PRESENCE
+                    // of one is real evidence the client accepts it. Reading it in that one
+                    // direction is sound; reading it in the other is the bug it warns about.
+                    //
+                    // Measured stakes: AAC 7.1 at 1152k sits ~32 dB closer to the source than
+                    // the AC-3 5.1 sidecar, so re-encoding beats reusing whenever it is
+                    // available. Below that the sidecar wins on both quality and CPU, which
+                    // is why it stays the floor rather than being dropped. D53.
+                    var lidslabsTranscodeRungAvailable =
+                        LidslabsResolveAudioRung(state) is not null;
+
+                    if (isProblematicLosslessSource && !lidslabsTranscodeRungAvailable)
                     {
                         var originalLanguage = state.AudioStream.Language;
 
@@ -7825,6 +8050,32 @@ namespace MediaBrowser.Controller.MediaEncoding
 
                 request.AudioCodec = state.SupportedAudioCodecs.FirstOrDefault(_mediaEncoder.CanEncodeToAudioCodec)
                     ?? state.SupportedAudioCodecs.FirstOrDefault();
+
+                // lidslabs v0.4.0: apply the operator's audio ladder on top of the stock
+                // choice. Stock takes the client's FIRST encodable codec; the ladder takes
+                // the first codec the OPERATOR ranked that the client also accepts, which is
+                // the whole point of the lever — a client offering "opus,aac" against a
+                // ladder of "copy,aac,sidecar" should get aac, not opus.
+                //
+                // Only applied when the ladder actually resolves a transcode rung; otherwise
+                // the stock choice above stands untouched, so an unset or exhausted lever is
+                // a strict no-op.
+                var lidslabsRung = LidslabsResolveAudioRung(state);
+                if (lidslabsRung is not null)
+                {
+                    request.AudioCodec = lidslabsRung.Codec;
+
+                    // A rate on the rung is an operator ceiling, not a target: it stays a
+                    // Math.Min against the negotiated budget downstream. Normally absent —
+                    // the per-channel default (144 kbps/ch) is better than any absolute
+                    // number, because an absolute one is only ever right for one layout.
+                    if (lidslabsRung.Bitrate is not null)
+                    {
+                        request.AudioBitRate = request.AudioBitRate.HasValue
+                            ? Math.Min(request.AudioBitRate.Value, lidslabsRung.Bitrate.Value)
+                            : lidslabsRung.Bitrate.Value;
+                    }
+                }
             }
 
             var supportedVideoCodecs = state.SupportedVideoCodecs;
@@ -8113,6 +8364,8 @@ namespace MediaBrowser.Controller.MediaEncoding
                 return args;
             }
 
+            args += GetLidslabsAudioEncoderQualityParams(codec);
+
             var channels = state.OutputAudioChannels;
 
             var useDownMixAlgorithm = state.AudioStream is not null
@@ -8176,6 +8429,12 @@ namespace MediaBrowser.Controller.MediaEncoding
             if (!string.IsNullOrEmpty(outputCodec))
             {
                 audioTranscodeParams.Add("-acodec " + GetAudioEncoder(state));
+
+                var lidslabsQualityParams = GetLidslabsAudioEncoderQualityParams(GetAudioEncoder(state));
+                if (lidslabsQualityParams.Length > 0)
+                {
+                    audioTranscodeParams.Add(lidslabsQualityParams.TrimStart());
+                }
             }
 
             if (GetAudioEncoder(state).StartsWith("pcm_", StringComparison.Ordinal))
