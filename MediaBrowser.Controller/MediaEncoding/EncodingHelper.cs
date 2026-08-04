@@ -63,6 +63,25 @@ namespace MediaBrowser.Controller.MediaEncoding
         private const string CudaAlias = "cu";
         private const string DrmAlias = "dr";
         private const string VulkanAlias = "vk";
+
+        /// <summary>
+        /// Default audio delivery ladder (lidslabs v0.4.0).
+        /// </summary>
+        /// <remarks>
+        /// Note the absence of a rate on <c>aac</c>. The useful target is a per-channel rate —
+        /// 144 kbps/channel, which is where libfdk_aac stops improving on loud wideband 7.1
+        /// content — and that is already the default in both GetDefaultAudioBitrate and
+        /// GetAudioBitrateParam, so it is derived from the negotiated channel count (8ch ->
+        /// 1152k, 6ch -> 864k) and then clamped against the session's total bitrate budget.
+        /// Writing an absolute "@1152k" here would be correct for 7.1 and silently wrong for
+        /// every other layout, so a rate is accepted as an operator override but is not the
+        /// normal way to use this lever.
+        /// <para>
+        /// The ladder stops at <c>sidecar</c> deliberately: every rung that could sit below it
+        /// measured worse than simply letting Jellyfin negotiate unaided.
+        /// </para>
+        /// </remarks>
+        private const string LidslabsDefaultAudioLadder = "copy,aac,sidecar";
         private readonly IApplicationPaths _appPaths;
         private readonly IMediaEncoder _mediaEncoder;
         private readonly ISubtitleEncoder _subtitleEncoder;
@@ -2901,25 +2920,6 @@ namespace MediaBrowser.Controller.MediaEncoding
         }
 
         /// <summary>
-        /// Default audio delivery ladder (lidslabs v0.4.0).
-        /// </summary>
-        /// <remarks>
-        /// Note the absence of a rate on <c>aac</c>. The useful target is a per-channel rate —
-        /// 144 kbps/channel, which is where libfdk_aac stops improving on loud wideband 7.1
-        /// content — and that is already the default in both GetDefaultAudioBitrate and
-        /// GetAudioBitrateParam, so it is derived from the negotiated channel count (8ch ->
-        /// 1152k, 6ch -> 864k) and then clamped against the session's total bitrate budget.
-        /// Writing an absolute "@1152k" here would be correct for 7.1 and silently wrong for
-        /// every other layout, so a rate is accepted as an operator override but is not the
-        /// normal way to use this lever.
-        /// <para>
-        /// The ladder stops at <c>sidecar</c> deliberately: every rung that could sit below it
-        /// measured worse than simply letting Jellyfin negotiate unaided.
-        /// </para>
-        /// </remarks>
-        private const string LidslabsDefaultAudioLadder = "copy,aac,sidecar";
-
-        /// <summary>
         /// Resolves the highest-ranked transcode rung the client will actually accept.
         /// </summary>
         /// <param name="state">The job.</param>
@@ -3014,13 +3014,6 @@ namespace MediaBrowser.Controller.MediaEncoding
 
             return value > int.MaxValue / multiplier ? null : value * multiplier;
         }
-
-        /// <summary>
-        /// A resolved transcode rung from the audio ladder (lidslabs v0.4.0).
-        /// </summary>
-        /// <param name="Codec">The output audio codec.</param>
-        /// <param name="Bitrate">An explicit operator ceiling in bits per second, or null to derive it per channel.</param>
-        private sealed record LidslabsAudioRung(string Codec, int? Bitrate);
 
         /// <summary>
         /// Encoder-specific quality flags that ffmpeg's defaults get wrong for our targets (lidslabs v0.4.0).
@@ -8020,6 +8013,7 @@ namespace MediaBrowser.Controller.MediaEncoding
                         }
                     }
                 }
+
                 // ============================================================
 
                 if (state.SubtitleStream is not null && !state.SubtitleStream.IsExternal)
@@ -8547,5 +8541,12 @@ namespace MediaBrowser.Controller.MediaEncoding
             // -vsync is deprecated in FFmpeg 5.1 and will be removed in the future.
             return $" -vsync {videoSync}";
         }
+
+        /// <summary>
+        /// A resolved transcode rung from the audio ladder (lidslabs v0.4.0).
+        /// </summary>
+        /// <param name="Codec">The output audio codec.</param>
+        /// <param name="Bitrate">An explicit operator ceiling in bits per second, or null to derive it per channel.</param>
+        private sealed record LidslabsAudioRung(string Codec, int? Bitrate);
     }
 }
