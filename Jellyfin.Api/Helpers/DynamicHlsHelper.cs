@@ -215,6 +215,29 @@ public class DynamicHlsHelper
         {
             var encodingOptions = _serverConfigurationManager.GetEncodingOptions();
 
+            // lidslabs v0.4.0: negotiate the COPY path's SDR rung codec, exactly as v0.3.4 already
+            // does for the passthrough-transcode rung below.
+            //
+            // v0.3.4 taught this file that "no HDR display" must not imply "no HEVC" -- but it only
+            // taught the transcode rung. A remux (container/audio only, video copied) never reaches
+            // that rung: it is gated on !IsCopyCodec. It lands here instead, in stock Jellyfin's
+            // copy-path ladder, which emits an HEVC SDR entrance AND an H.264 SDR entrance at the
+            // SAME BANDWIDTH -- and HLS defines no tie-break between two variants that differ only
+            // in CODECS. Measured on dev 2026-08-03: Neptune AV, offered exactly that pair, took
+            // H.264, on a client we explicitly force HEVC for. That is the ~40% efficiency loss
+            // v0.3.4 exists to prevent, still live on every HDR title that remuxes.
+            //
+            // So apply the same rule here: SWAP the rung's codec, never ADD a second rung. The
+            // decision is the same helper, on the query the client echoed back, evaluated BEFORE
+            // anything mutates it -- see the defensive copies below for why that ordering is
+            // load-bearing.
+            //
+            // AV1 is deliberately left alone. It is gated on the source already being AV1, so it
+            // can never co-occur with the HEVC rung, and narrowing it would risk leaving an
+            // AV1-incapable client with no SDR entrance at all. Its behaviour is byte-identical.
+            var lidslabsSdrRungCodec = LidslabsSdrRungCodec(playlistQuery);
+            var lidslabsHevcSdrRungEmitted = false;
+
             // Provide AV1 and HEVC SDR entrances for backward compatibility.
             foreach (var sdrVideoCodec in new[] { "av1", "hevc" })
             {
@@ -223,7 +246,9 @@ public class DynamicHlsHelper
                     && string.Equals(state.ActualOutputVideoCodec, "av1", StringComparison.OrdinalIgnoreCase);
                 var isHevcEncodingAllowed = encodingOptions.AllowHevcEncoding
                     && string.Equals(sdrVideoCodec, "hevc", StringComparison.OrdinalIgnoreCase)
-                    && string.Equals(state.ActualOutputVideoCodec, "hevc", StringComparison.OrdinalIgnoreCase);
+                    && string.Equals(state.ActualOutputVideoCodec, "hevc", StringComparison.OrdinalIgnoreCase)
+                    // lidslabs: only when the client actually asked for HEVC and can take it as SDR.
+                    && string.Equals(lidslabsSdrRungCodec, "hevc", StringComparison.OrdinalIgnoreCase);
                 var isEncodingAllowed = isAv1EncodingAllowed || isHevcEncodingAllowed;
 
                 if (isEncodingAllowed
@@ -233,7 +258,13 @@ public class DynamicHlsHelper
                     // Force AV1 and HEVC Main Profile and disable video stream copy.
                     state.OutputVideoCodec = sdrVideoCodec;
 
-                    var sdrPlaylistQuery = playlistQuery;
+                    // lidslabs: a COPY, not the alias stock used. `var x = playlistQuery` handed
+                    // every block the caller's own dictionary, so each rung's writes persisted into
+                    // the next one and into everything downstream -- visible on the wire as an
+                    // `hevc-profile=main` we wrote for the HEVC rung riding along on the H.264 URL.
+                    // It also corrupts the input this fix reads: by the H.264 block below,
+                    // playlistQuery["VideoCodec"] was already "hevc" -- a value we wrote ourselves.
+                    var sdrPlaylistQuery = new Dictionary<string, Microsoft.Extensions.Primitives.StringValues>(playlistQuery);
                     sdrPlaylistQuery["VideoCodec"] = sdrVideoCodec;
                     sdrPlaylistQuery[sdrVideoCodec + "-profile"] = "main";
                     sdrPlaylistQuery["AllowVideoStreamCopy"] = "false";
@@ -245,17 +276,28 @@ public class DynamicHlsHelper
 
                     // Restore the video codec
                     state.OutputVideoCodec = "copy";
+
+                    if (isHevcEncodingAllowed)
+                    {
+                        lidslabsHevcSdrRungEmitted = true;
+                    }
                 }
             }
 
             // Provide H.264 SDR entrance for backward compatibility.
-            if (EncodingHelper.IsCopyCodec(state.OutputVideoCodec)
+            // lidslabs: skipped when the HEVC rung above already provided one. Emitting both would
+            // put two SDR variants at the same BANDWIDTH in the master and leave the client's choice
+            // between them undefined -- the exact hazard the passthrough rung's "swap, never an
+            // addition" rule was written for.
+            if (!lidslabsHevcSdrRungEmitted
+                && EncodingHelper.IsCopyCodec(state.OutputVideoCodec)
                 && state.VideoStream.VideoRange == VideoRange.HDR)
             {
                 // Force H.264 and disable video stream copy.
                 state.OutputVideoCodec = "h264";
 
-                var sdrPlaylistQuery = playlistQuery;
+                // lidslabs: copy, not alias -- see the HEVC rung above.
+                var sdrPlaylistQuery = new Dictionary<string, Microsoft.Extensions.Primitives.StringValues>(playlistQuery);
                 sdrPlaylistQuery["VideoCodec"] = "h264";
                 sdrPlaylistQuery["AllowVideoStreamCopy"] = "false";
 
@@ -394,7 +436,11 @@ public class DynamicHlsHelper
             var variation = GetBitrateVariation(totalBitrate);
 
             var newBitrate = totalBitrate - variation;
-            var variantQuery = playlistQuery;
+            // lidslabs: copy, not alias. Stock aliased the caller's dictionary here too, so the
+            // adaptive-bitrate variants inherited whatever the SDR rungs above had written into it
+            // -- an ABR ladder built from the SDR rung's codec rather than the variant it is meant
+            // to shadow. The rungs no longer mutate it, so this is defence in depth.
+            var variantQuery = new Dictionary<string, Microsoft.Extensions.Primitives.StringValues>(playlistQuery);
             variantQuery["VideoBitrate"] = (requestedVideoBitrate - variation).ToString(CultureInfo.InvariantCulture);
             var variantUrl = Microsoft.AspNetCore.WebUtilities.QueryHelpers.AddQueryString(baseUrl, variantQuery);
             AppendPlaylist(builder, state, variantUrl, newBitrate, subtitleGroup);
