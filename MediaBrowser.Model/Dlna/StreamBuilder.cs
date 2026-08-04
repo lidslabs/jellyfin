@@ -1133,9 +1133,43 @@ namespace MediaBrowser.Model.Dlna
         {
             if (!string.IsNullOrEmpty(audioCodec))
             {
-                // Default to a higher bitrate for stream copy
+                // lidslabs v0.4.0: AAC and Opus split out of the AC-3 group.
+                //
+                // This is the SECOND of two 640 kbps multichannel ceilings — the other is
+                // EncodingHelper.GetAudioBitrateParam — and it is the one that actually
+                // binds in the streaming path. StreamBuilder's value travels to the
+                // transcode as &AudioBitrate= in the stream URL and arrives as
+                // request.AudioBitRate, which EncodingHelper then takes a Math.Min
+                // against. Raising only the EncodingHelper ceiling therefore changes
+                // nothing: 640000 wins the Math.Min. Both had to move.
+                //
+                // 640 kbps is AC-3's spec maximum, so it is right for ac3 and harmless
+                // for ffmpeg's eac3 (flat 640k->1536k). AAC and Opus have no such limit,
+                // and the shared ceiling held 7.1 AAC to 80 kbps/channel. They now get
+                // 144 kbps/channel (8ch -> 1152k, 6ch -> 864k), which is where libfdk_aac
+                // stops improving on loud wideband 7.1 content.
+                //
+                // Remote bandwidth is NOT at risk from this: the caller clamps whatever
+                // is returned here through GetMaxAudioBitrateForTotalBitrate, which caps
+                // audio at 384k on a 2 Mbps budget and 640k on a 4 Mbps one. Only sessions
+                // already negotiating >=5 Mbps can reach the higher ceiling, so the extra
+                // audio bitrate is never taken out of a constrained video budget.
+                //
+                // Opus was previously absent from every branch here and fell through to
+                // the 192000 default, which is why it is added rather than merely split.
                 if (string.Equals(audioCodec, "aac", StringComparison.OrdinalIgnoreCase)
-                    || string.Equals(audioCodec, "mp3", StringComparison.OrdinalIgnoreCase)
+                    || string.Equals(audioCodec, "opus", StringComparison.OrdinalIgnoreCase))
+                {
+                    if ((audioChannels ?? 0) < 2)
+                    {
+                        return 128000;
+                    }
+
+                    return (audioChannels ?? 0) >= 6 ? (audioChannels ?? 0) * 144000 : 384000;
+                }
+
+                // Default to a higher bitrate for stream copy
+                if (string.Equals(audioCodec, "mp3", StringComparison.OrdinalIgnoreCase)
                     || string.Equals(audioCodec, "ac3", StringComparison.OrdinalIgnoreCase)
                     || string.Equals(audioCodec, "eac3", StringComparison.OrdinalIgnoreCase))
                 {
