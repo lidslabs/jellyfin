@@ -42,17 +42,18 @@ public static class LidslabsEnv
     /// <summary>Clients given an SDR companion rung on the HDR master. Legacy: LIDSLABS_SDR_LADDER_CLIENTS.</summary>
     public const string SdrLadderClients = "LIDSLABS_TRANSCODE_SDR_LADDER_CLIENTS";
 
-    /// <summary>Enables the NVEncC transcode engine.</summary>
-    public const string Nvencc = "LIDSLABS_TRANSCODE_NVENCC";
-
-    /// <summary>NVEncC QVBR quality target.</summary>
-    public const string NvenccQvbr = "LIDSLABS_TRANSCODE_NVENCC_QVBR";
-
-    /// <summary>Path to the NVEncC binary. Legacy: LIDSLABS_NVENCC_PATH.</summary>
-    public const string NvenccPath = "LIDSLABS_TRANSCODE_NVENCC_PATH";
-
-    /// <summary>Clients eligible for the Dolby Vision preservation path.</summary>
-    public const string DvClients = "LIDSLABS_TRANSCODE_DV_CLIENTS";
+    // NO NVEncC LEVERS, AND NO DV-CLIENT LEVER — deliberately, see the class remarks.
+    //
+    // Earlier v0.4.0 drafts declared LIDSLABS_TRANSCODE_NVENCC{,_QVBR,_PATH} and
+    // LIDSLABS_TRANSCODE_DV_CLIENTS here. The NVEncC engine was dropped (measurement showed
+    // ffmpeg equals or beats it on every path we care about, and its libplacebo tonemapper
+    // exits 1 on this host), and the DV preservation path is deferred past v0.4.0. Both sets
+    // of constants outlived their implementations and became dead config surface.
+    //
+    // That is not harmless. A lever an operator can set that silently does nothing is the
+    // exact shape of the v0.3.3 SDR-companion bug this class was written to prevent — the
+    // deployment looks configured and behaves as if it is not. A lever ships in the same
+    // commit as the code that reads it, or it does not ship.
 
     /// <summary>Ranked video codec preference, e.g. "hevc,h264".</summary>
     public const string PreferredVideoCodec = "LIDSLABS_TRANSCODE_PREFERRED_VIDEO_CODEC";
@@ -69,7 +70,6 @@ public static class LidslabsEnv
         [AllowHdr] = "LIDSLABS_ALLOW_HDR_TRANSCODE",
         [ForceHevcClients] = "LIDSLABS_FORCE_HEVC_CLIENTS",
         [SdrLadderClients] = "LIDSLABS_SDR_LADDER_CLIENTS",
-        [NvenccPath] = "LIDSLABS_NVENCC_PATH",
     };
 
     private static readonly SortedDictionary<string, string> _legacyUsages = new(StringComparer.Ordinal);

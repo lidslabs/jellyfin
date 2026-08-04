@@ -33,6 +33,20 @@ namespace Jellyfin.Api.Controllers;
 [Authorize]
 public class MediaInfoController : BaseJellyfinApiController
 {
+    /// <summary>
+    /// Default ranked video codec preference (lidslabs v0.4.0).
+    /// </summary>
+    /// <remarks>
+    /// AV1 is deliberately absent. Its advantage is compression efficiency, which converts to
+    /// visible quality only where bitrate is scarce, and at the ~20 Mbps these transcodes run at,
+    /// HEVC is already at or near transparency. Dolby Vision's per-shot RPU trims are a different
+    /// axis that does not diminish with bitrate — so ranking AV1 first would trade a per-scene
+    /// accurate picture for compression nobody here needs. Add it for SDR/HDR10-only titles, or
+    /// once DV-in-AV1 has renderers worth targeting; the range term in LidslabsCodecPreservesRange
+    /// already makes that a pure config change.
+    /// </remarks>
+    private const string LidslabsDefaultVideoCodecs = "hevc,h264";
+
     private readonly IMediaSourceManager _mediaSourceManager;
     private readonly IDeviceManager _deviceManager;
     private readonly ILibraryManager _libraryManager;
@@ -341,6 +355,135 @@ public class MediaInfoController : BaseJellyfinApiController
                     itemId);
             }
 
+            // ================================================================
+            // lidslabs v0.4.0: ranked video codec preference
+            // ================================================================
+            // LIDSLABS_TRANSCODE_PREFERRED_VIDEO_CODEC is a ranked list, newest-first,
+            // e.g. "hevc,h264". It reorders each video TranscodingProfile's codec list
+            // so StreamBuilder picks the operator's preference rather than the client's
+            // own ordering.
+            //
+            // THREE TERMS, all required:
+            //   rank            the operator's order
+            //   ∩ advertised    the client must already list the codec. We never invent
+            //                   capability — same safeguard as force-HEVC above.
+            //   ∩ preserves-range  see below. This is the term that is easy to omit and
+            //                   expensive to omit.
+            //
+            // WHY THE RANGE TERM EXISTS. A naive newest-first list silently destroys the
+            // features the rest of this project exists to deliver:
+            //   * h264 CANNOT CARRY HDR10 AT ALL. Ranking it above hevc on an HDR source
+            //     produces a tonemapped SDR stream with no error anywhere — that was the
+            //     Swiftfin washout root cause (DEBUG_LOG 2026-07-21).
+            //   * DV RPU preservation is HEVC-ONLY. The RPU is carried in HEVC NAL unit
+            //     type 62; DV-in-AV1 is specified but essentially nothing renders it. On a
+            //     DV title an "av1"-first list would pick AV1 and DISCARD THE RPU, silently.
+            // So the conditional lives HERE, in the selector, not in the env var. The var
+            // stays a flat operator preference; adding "av1" later is then a pure config
+            // change that cannot accidentally cost us DV or HDR.
+            //
+            // AV1 is deliberately NOT in the default (Nick, 2026-08-01): its advantage is
+            // compression efficiency, which converts to visible quality only when bitrate
+            // is scarce, and at ~20 Mbps HEVC is already at or near transparency. DV's
+            // per-shot RPU trims are a different axis that does not diminish with bitrate.
+            // Add it for SDR/HDR10-only titles, or once DV-in-AV1 has renderers.
+            var lidslabsPreferredVideoCodecs =
+                LidslabsEnv.List(LidslabsEnv.PreferredVideoCodec, LidslabsDefaultVideoCodecs);
+
+            // Read into a local rather than testing info.MediaSources for null: a
+            // `?.` here flips the compiler's null-state for the property and turns the
+            // pre-existing `foreach (var mediaSource in info.MediaSources)` further
+            // down this method into a CS8602.
+            var lidslabsSources = info.MediaSources;
+            var lidslabsSourceRange = lidslabsSources
+                .SelectMany(ms => ms.MediaStreams ?? Enumerable.Empty<MediaStream>())
+                .FirstOrDefault(s => s.Type == MediaStreamType.Video)?
+                .VideoRangeType ?? VideoRangeType.Unknown;
+
+            // lidslabs v0.4.0: record what the CLIENT declares it can decode, not just
+            // what we decided to send it.
+            //
+            // We could not answer "do any of our clients actually accept Dolby Vision?"
+            // from months of logs, because nothing ever recorded the client side of the
+            // negotiation — only our own gate outcomes. That question gates the DV-output
+            // feature entirely: emitting a correct P8.1 RPU is worthless if no client
+            // asks for DOVIWithHDR10, and we would have shipped it blind.
+            //
+            // VideoRangeType conditions live in CodecProfiles, not TranscodingProfiles,
+            // and a profile that declares NOTHING is not the same as one that declares
+            // no DV support — an absent condition means "unconstrained", i.e. the client
+            // never narrowed the range at all. Both cases are logged distinctly.
+            var lidslabsDeclaredRanges = profile.CodecProfiles
+                .SelectMany(cp => cp.Conditions.Concat(cp.ApplyConditions))
+                .Where(c => c.Property == ProfileConditionValue.VideoRangeType)
+                .Select(c => c.Value)
+                .Where(v => !string.IsNullOrWhiteSpace(v))
+                .SelectMany(v => v.Split('|', StringSplitOptions.RemoveEmptyEntries | StringSplitOptions.TrimEntries))
+                .Distinct(StringComparer.OrdinalIgnoreCase)
+                .OrderBy(v => v, StringComparer.OrdinalIgnoreCase)
+                .ToArray();
+
+            _logger.LogInformation(
+                "lidslabs.clientCaps: profile={ProfileName}, client={Client}, sourceRange={SourceRange}, "
+                + "declaredRanges={DeclaredRanges}, declaresDovi={DeclaresDovi}, item={ItemId}",
+                profile.Name,
+                User.GetClient(),
+                lidslabsSourceRange,
+                lidslabsDeclaredRanges.Length == 0 ? "(none declared)" : string.Join('|', lidslabsDeclaredRanges),
+                lidslabsDeclaredRanges.Any(v => v.Contains("DOVI", StringComparison.OrdinalIgnoreCase)),
+                itemId);
+
+            if (lidslabsPreferredVideoCodecs.Count > 0)
+            {
+                var lidslabsRangeEligible = LidslabsCodecPreservesRange(lidslabsSourceRange);
+                var lidslabsReordered = false;
+
+                foreach (var tp in profile.TranscodingProfiles.Where(t => t.Type == DlnaProfileType.Video))
+                {
+                    var advertised = LidslabsSplitTrim(tp.VideoCodec);
+                    if (advertised.Length == 0)
+                    {
+                        continue;
+                    }
+
+                    // rank ∩ advertised ∩ preserves-range
+                    var ranked = lidslabsPreferredVideoCodecs
+                        .Where(c => advertised.Contains(c, StringComparer.OrdinalIgnoreCase))
+                        .Where(lidslabsRangeEligible)
+                        .ToList();
+
+                    if (ranked.Count == 0)
+                    {
+                        // Nothing the operator ranked survives for this source. Leave the
+                        // client's own list alone rather than narrowing it — a lever that
+                        // can only ever REMOVE options is a lever that can break playback.
+                        continue;
+                    }
+
+                    // Anything advertised but unranked keeps its relative order at the
+                    // back, so this is a reordering rather than a whitelist.
+                    var remainder = advertised
+                        .Where(c => !ranked.Contains(c, StringComparer.OrdinalIgnoreCase));
+
+                    var rewritten = string.Join(",", ranked.Concat(remainder));
+                    if (!string.Equals(rewritten, tp.VideoCodec, StringComparison.OrdinalIgnoreCase))
+                    {
+                        tp.VideoCodec = rewritten;
+                        lidslabsReordered = true;
+                    }
+                }
+
+                // Information, not Debug, and for the same reason the client-identity
+                // gates were promoted in v0.3.4: a preference that silently fails to
+                // apply looks exactly like one that had no work to do.
+                _logger.LogInformation(
+                    "lidslabs.videoCodec: profile={ProfileName}, ranked={Ranked}, sourceRange={SourceRange}, reordered={Reordered}",
+                    profile.Name,
+                    string.Join(",", lidslabsPreferredVideoCodecs),
+                    lidslabsSourceRange,
+                    lidslabsReordered);
+            }
+
             // lidslabs v0.3.2 (patch 0009): Neptune AV Player is AVPlayer-on-tvOS,
             // the same renderer class as Swiftfin. When AV Player is the forced
             // client, also rewrite its video HLS container ts->mp4 so the forced
@@ -555,6 +698,29 @@ public class MediaInfoController : BaseJellyfinApiController
                     // Read the computed range BEFORE clearing any fields.
                     var rangeType = videoStream.VideoRangeType;
 
+                    // lidslabs v0.4.0: this rewrite is only correct while we emit HDR10.
+                    //
+                    // The flattening below exists because a transcoded DV source is
+                    // delivered as plain HDR10, so reporting DV to the client makes it
+                    // select a Dolby Vision display mode for bytes that carry no RPU.
+                    // That reasoning inverts the moment we can emit DV ourselves: we
+                    // proved this session that ffmpeg + dovi_tool produces a valid
+                    // Profile 8.1 stream (dv_bl_signal_compatibility_id=1), and when that
+                    // ships, flattening would tell the client "HDR10" while sending DV —
+                    // the client's DV path would never engage and the feature would look
+                    // like it simply did not work.
+                    //
+                    // So the condition is named for what actually decides it, rather than
+                    // left implicit in "we happen not to emit DV yet". DV output is
+                    // deferred (it needs per-segment RPU injection for HLS and a muxer
+                    // that writes dvcC — ffmpeg's mp4 muxer does not), so this returns
+                    // false today. When the DV path lands it becomes a per-transcode
+                    // question asked here, not an archaeology exercise in this method.
+                    if (LidslabsTranscodeEmitsDoVi())
+                    {
+                        continue;
+                    }
+
                     // HDR passthrough: only DV ranges whose HDR10/HLG base survives
                     // passthrough are eligible (bare DOVI profile 5 and DOVIWithSDR
                     // tonemap to SDR — leave them; native HDR10/HLG already correct).
@@ -618,6 +784,56 @@ public class MediaInfoController : BaseJellyfinApiController
 
         static string[] LidslabsSplitTrim(string? value)
             => (value ?? string.Empty).Split(',', StringSplitOptions.RemoveEmptyEntries | StringSplitOptions.TrimEntries);
+
+        // lidslabs v0.4.0: which output codecs can carry the source's dynamic range.
+        //
+        // Returns a predicate rather than a list so the caller reads as
+        // "rank ∩ advertised ∩ preserves-range" — the third term is the one that is
+        // easy to forget, and forgetting it fails SILENTLY: the stream still plays, it
+        // is just no longer HDR.
+        //
+        //   Dolby Vision  -> HEVC only. The RPU rides in HEVC NAL type 62; DV-in-AV1 is
+        //                    specified but essentially nothing renders it, so AV1 would
+        //                    discard the RPU. h264 cannot carry HDR at all.
+        //   HDR10/HLG     -> exclude h264. It has no HDR10 static-metadata carriage, so
+        //                    an h264 rung means a tonemapped SDR picture with no error
+        //                    logged anywhere (the Swiftfin washout, DEBUG_LOG 2026-07-21).
+        //   SDR/unknown   -> unrestricted. Unknown is deliberately permissive: refusing
+        //                    to rank on a range we could not compute would disable the
+        //                    lever on any item with odd probe output.
+        static Func<string, bool> LidslabsCodecPreservesRange(VideoRangeType rangeType)
+        {
+            var isDovi =
+                rangeType == VideoRangeType.DOVI
+                || rangeType == VideoRangeType.DOVIWithHDR10
+                || rangeType == VideoRangeType.DOVIWithEL
+                || rangeType == VideoRangeType.DOVIWithHDR10Plus
+                || rangeType == VideoRangeType.DOVIWithELHDR10Plus
+                || rangeType == VideoRangeType.DOVIWithHLG
+                || rangeType == VideoRangeType.DOVIWithSDR
+                || rangeType == VideoRangeType.DOVIInvalid;
+
+            if (isDovi)
+            {
+                return codec =>
+                    string.Equals(codec, "hevc", StringComparison.OrdinalIgnoreCase)
+                    || string.Equals(codec, "h265", StringComparison.OrdinalIgnoreCase);
+            }
+
+            var isHdr =
+                rangeType == VideoRangeType.HDR10
+                || rangeType == VideoRangeType.HDR10Plus
+                || rangeType == VideoRangeType.HLG;
+
+            if (isHdr)
+            {
+                return codec =>
+                    !string.Equals(codec, "h264", StringComparison.OrdinalIgnoreCase)
+                    && !string.Equals(codec, "avc", StringComparison.OrdinalIgnoreCase);
+            }
+
+            return _ => true;
+        }
 
         // Maps user-facing client names (e.g. "neptune", "streamyfin") to the
         // internal profile.Name substring(s) that identify each Jellyfin client
@@ -790,6 +1006,14 @@ public class MediaInfoController : BaseJellyfinApiController
         // be kept in agreement by convention. Both now call the one parse, so they cannot
         // drift. Retained as a named local function purely so the call sites below still
         // read as intent rather than as an env lookup.
+        // lidslabs v0.4.0: does THIS transcode deliver a Dolby Vision bitstream?
+        //
+        // Gates the delivered-range rewrite above. Constant false while the server can
+        // only emit HDR10 — see the comment at the call site for why this must become a
+        // real per-transcode answer before DV output ships, and what breaks if it does
+        // not (client told HDR10, sent DV, never engages its DV path).
+        static bool LidslabsTranscodeEmitsDoVi() => false;
+
         static bool LidslabsHdrTranscodeEnabled()
             => LidslabsEnv.Flag(LidslabsEnv.AllowHdr);
 
