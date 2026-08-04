@@ -93,10 +93,10 @@ namespace MediaBrowser.Controller.MediaEncoding
         /// </para>
         /// <para>
         /// <c>sidecar</c> now outranks any transcode. The reason is not codec quality — on our own
-        /// measurements AC-3 640k scores ~26.8 dB against libfdk 5.1 @864k at ~41.6 dB — it is that
-        /// the sidecar is a stream COPY that BITSTREAMS over HDMI to a receiver, which AAC
+        /// measurements AC-3 640k scores ~26.8 dB against a libfdk 5.1 transcode far above it — it
+        /// is that the sidecar is a stream COPY that BITSTREAMS over HDMI to a receiver, which AAC
         /// categorically cannot. A correctly-rendered 640k bitstream can beat a badly-rendered
-        /// 864k PCM fold, and on Wholphin that is exactly what was reported by ear. ⚠ THIS IS THE
+        /// PCM fold, and on Wholphin that is exactly what was reported by ear. ⚠ THIS IS THE
         /// ONE RUNG STILL AWAITING A LISTENING TEST; if the A/B goes the other way, move
         /// <c>sidecar</c> back below a transcode rung via LIDSLABS_AUDIO_PREFERRED_CODEC.
         /// </para>
@@ -245,8 +245,10 @@ namespace MediaBrowser.Controller.MediaEncoding
         //   libfdk + 5.1.2          -> channelConfiguration=14, self-describing, but those are
         //       height channels; wrong semantics for a 7.1 source.
         //
-        // So 144 kbps/channel * 6 = 864k is the real ceiling for a transcoded AAC rung, and
-        // GetAudioBitrateParam already lands there.
+        // So 5.1 is the real ceiling for a transcoded AAC rung. The bitrate that goes with it
+        // was re-measured at 5.1 on 2026-08-04 (the 144 kbps/channel figure came from a 7.1
+        // sweep, for a case we no longer ship) and is now a flat 1024k — see the curve on
+        // GetAudioBitrateParam, and note it has to match StreamBuilder.GetDefaultAudioBitrate.
         //
         // AND IT IS NOT AN AAC PROBLEM — nothing else we can encode carries 7.1 either.
         // Measured 2026-08-03 against jellyfin-ffmpeg 8.1.2:
@@ -2965,15 +2967,16 @@ namespace MediaBrowser.Controller.MediaEncoding
             // rate). For AAC and Opus it is simply wrong: neither has any such limit, and
             // the shared ceiling silently held 7.1 AAC to 80 kbps/channel.
             //
-            // Measured on loud, wideband, transient-dense 7.1 content, libfdk_aac gains
-            // ~2.4 dB mean SNR going from 960k to 1152k and does not saturate below it,
-            // so 144 kbps/channel (8ch -> 1152k, 6ch -> 864k) is the useful target rather
-            // than an arbitrary one. Stays a Math.Min, so an explicit lower request from
-            // the client or the operator still wins.
+            // AAC now has its own branch below with a higher, separately-measured target.
+            // The 144 kbps/channel here is what remains for Opus/Vorbis/MP3, and it is
+            // deliberately NOT the AAC number: the 5.1 sweep that produced 170 kbps/channel
+            // was run against libfdk_aac only, and Opus is a far more efficient codec whose
+            // saturation point we have never measured. Raising this without measuring Opus
+            // would spend ~200 kbps/stream on nothing. Stays a Math.Min, so an explicit
+            // lower request from the client or the operator still wins.
             //
             // See scripts/atmos/DECISIONS.md D52.
             if (string.IsNullOrEmpty(audioCodec)
-                || string.Equals(audioCodec, "aac", StringComparison.OrdinalIgnoreCase)
                 || string.Equals(audioCodec, "mp3", StringComparison.OrdinalIgnoreCase)
                 || string.Equals(audioCodec, "opus", StringComparison.OrdinalIgnoreCase)
                 || string.Equals(audioCodec, "vorbis", StringComparison.OrdinalIgnoreCase))
@@ -2982,6 +2985,51 @@ namespace MediaBrowser.Controller.MediaEncoding
                 {
                     (>= 6, >= 6) => Math.Min(outputChannels * 144000, bitrate),
                     (>= 6, 0) => Math.Min(inputChannels * 144000, bitrate),
+                    (> 0, > 0) => Math.Min(outputChannels * 128000, bitrate),
+                    (> 0, _) => Math.Min(inputChannels * 128000, bitrate),
+                    (_, _) => Math.Min(384000, bitrate)
+                };
+            }
+
+            // lidslabs v0.4.0: AAC's multichannel target, measured at 5.1 rather than 7.1.
+            //
+            // D52 set 144 kbps/channel from a 7.1 sweep. 7.1 AAC has since been abandoned
+            // (libfdk signals every 8-channel layout as channelConfiguration 0, which Apple
+            // AVFoundation and Android's OMX decoder both refuse), so the ONLY multichannel
+            // AAC this server can actually emit is 5.1 — and 5.1 was never the case that got
+            // measured. Re-run 2026-08-04 against a native 5.1 DTS-HD MA source (two 60 s
+            // fixtures, action and dialogue, both validated to carry real content to 20 kHz),
+            // scoring SDR against the lossless source brick-wall limited to 16 kHz so the
+            // number reflects the audible band rather than the -cutoff bandwidth difference:
+            //
+            //   768k 33.9 | 864k 35.2 | 928k 36.0 | 992k 36.7 | 1024k 36.9
+            //   1088k 37.1 (peak) | 1152k 37.0 | 1280k 36.6
+            //
+            // libfdk_aac PEAKS near 1088k and then goes backwards — more bitrate is actively
+            // worse past that point. 1024k (171 kbps/channel at 5.1) sits on the flat top of that
+            // curve and reclaims ~1.7 dB that the 7.1-derived 144 was leaving unclaimed.
+            //
+            // This is an ABSOLUTE ceiling, not a per-channel rate, precisely because of the
+            // decline: an 8-channel input with an unresolved output channel count would other-
+            // wise ask for 8 * 170000 = 1360k for a stream libfdk will encode as 6 channels,
+            // landing well past the peak. Same shape as the ac3/eac3/dts branches below.
+            //
+            // Encoder choice is settled at this rate too: ffmpeg's native AAC overtakes libfdk
+            // above ~1100k and reaches a higher absolute ceiling (39.6 dB at 1280k), but needs
+            // ~18% more bitrate just to match libfdk's peak, and at every rate we would
+            // realistically choose it trails by 3.1 to 4.5 dB. Jellyfin already prefers libfdk
+            // when the build has it; that preference is correct and we leave it alone.
+            //
+            // CAVEAT for whoever revisits this: SDR is a waveform-difference metric and AAC is
+            // a perceptual codec that discards inaudible detail by design, so these numbers
+            // rank information preserved, NOT audibility. At 170 kbps/channel both encoders are
+            // plausibly transparent. Do not treat a 1-2 dB delta here as an audible one without
+            // an ABX test or a real perceptual model (ViSQOL/PEAQ).
+            if (string.Equals(audioCodec, "aac", StringComparison.OrdinalIgnoreCase))
+            {
+                return (inputChannels, outputChannels) switch
+                {
+                    (>= 6, >= 6 or 0) => Math.Min(1024000, bitrate),
                     (> 0, > 0) => Math.Min(outputChannels * 128000, bitrate),
                     (> 0, _) => Math.Min(inputChannels * 128000, bitrate),
                     (_, _) => Math.Min(384000, bitrate)
@@ -3123,10 +3171,21 @@ namespace MediaBrowser.Controller.MediaEncoding
         /// libfdk_aac applies a hard 17.0 kHz lowpass by default, at EVERY bitrate, independent of
         /// content — and Jellyfin prefers libfdk whenever the build has it (see GetAudioEncoder)
         /// while never setting -cutoff. The result was that every AAC transcode this server has ever
-        /// produced lost everything above 17 kHz for no bitrate saving. Measured on real content:
-        /// -cutoff 20000 moves the front-channel spectral edge from 17.0 kHz to 19.7 kHz (source:
-        /// 20.0 kHz) and costs =0.4 dB SNR at 1152k. 20000 is fdk's documented ceiling; asking for
-        /// 22050 is rejected outright ("cutoff valid range is 188-20000").
+        /// produced lost everything above 17 kHz. Confirmed by reading the output spectrum rather
+        /// than trusting the flag: the default is 14 dB down by 19-20 kHz and behaves identically at
+        /// 864k and 1152k, so it is fixed, not adaptive. -cutoff 20000 tracks the source to within
+        /// ~1 dB across the whole band. 20000 is fdk's hard ceiling; 22000 is rejected outright
+        /// ("cutoff valid range is 188-20000"). ffmpeg's native AAC needs no such flag.
+        /// <para>
+        /// It is NOT free, and D52's "=0.4 dB" undersells the cost because that was a FULL-BAND
+        /// figure, where the recovered top octave roughly cancels the loss underneath it. Measured
+        /// in the audible band alone (SDR brick-walled at 16 kHz, 5.1), the bits spent above 17 kHz
+        /// cost 1.3 dB at 864k and 1.8 dB at 1024k. Both numbers are right; they measure different
+        /// things. The trade is still worth taking at the 1024k target set in GetAudioBitrateParam,
+        /// which more than repays it — but if the bitrate ceiling is ever lowered again, revisit
+        /// this flag at the same time, because at a constrained rate the honest choice may be to
+        /// keep the bits below 17 kHz where they can actually be heard.
+        /// </para>
         /// </remarks>
         public static string GetLidslabsAudioEncoderQualityParams(string encoder)
         {

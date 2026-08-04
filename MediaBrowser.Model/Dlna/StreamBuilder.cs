@@ -1145,20 +1145,39 @@ namespace MediaBrowser.Model.Dlna
                 //
                 // 640 kbps is AC-3's spec maximum, so it is right for ac3 and harmless
                 // for ffmpeg's eac3 (flat 640k->1536k). AAC and Opus have no such limit,
-                // and the shared ceiling held 7.1 AAC to 80 kbps/channel. They now get
-                // 144 kbps/channel (8ch -> 1152k, 6ch -> 864k), which is where libfdk_aac
-                // stops improving on loud wideband 7.1 content.
+                // and the shared ceiling held 7.1 AAC to 80 kbps/channel.
+                //
+                // AAC and Opus are separate branches rather than one, because their targets
+                // were measured separately and no longer agree. AAC gets a flat 1024k for
+                // the multichannel case: 5.1 is the only multichannel AAC we can emit, and a
+                // 2026-08-04 sweep on native 5.1 content puts libfdk_aac's peak near 1088k
+                // with a measurable DECLINE past it, so a per-channel rate that could scale
+                // to 1360k would be actively worse. Opus keeps 144 kbps/channel — it is a
+                // much more efficient codec and its saturation point has never been measured
+                // here, so it is left where D52 put it rather than dragged along.
+                // The full curve and the caveats live on EncodingHelper.GetAudioBitrateParam;
+                // this value and that one must move together or the Math.Min hides the change.
                 //
                 // Remote bandwidth is NOT at risk from this: the caller clamps whatever
                 // is returned here through GetMaxAudioBitrateForTotalBitrate, which caps
-                // audio at 384k on a 2 Mbps budget and 640k on a 4 Mbps one. Only sessions
-                // already negotiating >=5 Mbps can reach the higher ceiling, so the extra
-                // audio bitrate is never taken out of a constrained video budget.
+                // audio at 384k on a 2 Mbps budget, 640k on a 4 Mbps one and 768k on a
+                // 5 Mbps one. Only sessions already negotiating >5 Mbps can reach 1024k,
+                // so the extra audio bitrate is never taken out of a constrained video
+                // budget — a constrained client simply keeps the ceiling it had before.
                 //
                 // Opus was previously absent from every branch here and fell through to
                 // the 192000 default, which is why it is added rather than merely split.
-                if (string.Equals(audioCodec, "aac", StringComparison.OrdinalIgnoreCase)
-                    || string.Equals(audioCodec, "opus", StringComparison.OrdinalIgnoreCase))
+                if (string.Equals(audioCodec, "aac", StringComparison.OrdinalIgnoreCase))
+                {
+                    if ((audioChannels ?? 0) < 2)
+                    {
+                        return 128000;
+                    }
+
+                    return (audioChannels ?? 0) >= 6 ? 1024000 : 384000;
+                }
+
+                if (string.Equals(audioCodec, "opus", StringComparison.OrdinalIgnoreCase))
                 {
                     if ((audioChannels ?? 0) < 2)
                     {
