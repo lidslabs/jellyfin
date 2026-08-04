@@ -1719,6 +1719,36 @@ namespace MediaBrowser.Controller.MediaEncoding
             return ".ts";
         }
 
+        /// <summary>
+        /// Whether the HDR-passthrough Main-tier/level pin applies to this encode. The pin and the
+        /// rate clamp MUST agree, so both ask this rather than re-deriving the condition.
+        /// </summary>
+        private static bool LidslabsHevcHdrLevelPinApplies(EncodingJobInfo state, string videoEncoder)
+            => IsHdrPassthroughMode(state)
+                && string.Equals(videoEncoder, "hevc_nvenc", StringComparison.OrdinalIgnoreCase);
+
+        /// <summary>
+        /// Whether the pinned level is the 2160p one (L5.1) rather than L5.0.
+        /// </summary>
+        private static bool LidslabsHevcHdrPinnedIs2160p(EncodingJobInfo state)
+            => state.OutputHeight >= 2160 || state.OutputWidth >= 3840;
+
+        /// <summary>
+        /// The HEVC <b>Main tier</b> MaxBR/MaxCPB ceiling, in bits, for the level pinned by the
+        /// HDR-passthrough path. Both <c>-maxrate</c> and <c>-bufsize</c> are validated against it
+        /// by NVENC; exceeding either fails encoder init outright.
+        /// </summary>
+        /// <remarks>
+        /// HEVC spec Table A.2: the limit is <c>MaxBR (kbit) * CpbBrNalFactor</c>, and
+        /// CpbBrNalFactor is 1100 for Main/Main10. L5.0 -> 25000 * 1100 = 27,500,000;
+        /// L5.1 -> 40000 * 1100 = 44,000,000. Measured on an RTX 5080 / jellyfin-ffmpeg 7.1.4
+        /// with a 2160p HDR source: bufsize 44,000,000 initialises, 45,000,000 fails with
+        /// "InitializeEncoder failed: invalid param (8): Invalid Level"; maxrate is validated
+        /// the same way (maxrate 50,000,000 fails even with bufsize 40,000,000).
+        /// </remarks>
+        private static int LidslabsHevcHdrPinnedRateCeiling(EncodingJobInfo state)
+            => LidslabsHevcHdrPinnedIs2160p(state) ? 44_000_000 : 27_500_000;
+
         private string GetVideoBitrateParam(EncodingJobInfo state, string videoCodec)
         {
             if (state.OutputVideoBitrate is null)
@@ -1737,6 +1767,45 @@ namespace MediaBrowser.Controller.MediaEncoding
             // Currently use the same buffer size for all non-QSV encoders.
             // Use long arithmetic to prevent int32 overflow for very high bitrate values.
             int bufsize = (int)Math.Min((long)bitrate * 2, int.MaxValue);
+
+            // lidslabs: keep the rate control inside the level we PIN and ADVERTISE on the HDR
+            // passthrough path. NVENC validates BOTH -maxrate and -bufsize against -level, so the
+            // stock bufsize of 2x bitrate silently overflows Main tier L5.1's 44 Mbps ceiling as
+            // soon as the video bitrate exceeds ~22 Mbps -- ffmpeg then dies at encoder init
+            // ("Invalid Level", exit 234) and the client gets an HTTP 500 before a single frame
+            // exists. Measured 2026-08-04 on dev across five clients: a 20.2 Mbps encode
+            // (bufsize 40.4M) succeeded while every 23.848 Mbps encode (bufsize 47.7M) on this
+            // path failed, same code and same pin.
+            //
+            // Clamping is the correct repair rather than raising the level: the advertised CODECS
+            // string in the HLS manifest is derived from the same resolution rule (see
+            // NormalizeTranscodingLevel), and Apple AVPlayer refuses a stream whose bitstream and
+            // manifest disagree -- which is the very failure this pin exists to prevent. Bringing
+            // the encode inside the advertised level keeps that contract intact; moving the level
+            // would require both sides to move together.
+            //
+            // A bitrate above the ceiling is clamped too. That is a real quality reduction, but it
+            // is bounded, logged, and strictly better than the 500 it replaces -- and a level we
+            // advertise as L5.1 genuinely cannot carry more than 44 Mbps.
+            if (LidslabsHevcHdrLevelPinApplies(state, videoCodec))
+            {
+                var levelCeiling = LidslabsHevcHdrPinnedRateCeiling(state);
+
+                if (bitrate > levelCeiling || bufsize > levelCeiling)
+                {
+                    _logger.LogInformation(
+                        "lidslabs: clamping HDR passthrough rate control to the pinned level - bitrate {Bitrate} -> {ClampedBitrate}, bufsize {Bufsize} -> {ClampedBufsize} (Main tier {Level}, ceiling {Ceiling} bps)",
+                        bitrate,
+                        Math.Min(bitrate, levelCeiling),
+                        bufsize,
+                        Math.Min(bufsize, levelCeiling),
+                        LidslabsHevcHdrPinnedIs2160p(state) ? "L5.1" : "L5.0",
+                        levelCeiling);
+
+                    bitrate = Math.Min(bitrate, levelCeiling);
+                    bufsize = Math.Min(bufsize, levelCeiling);
+                }
+            }
 
             if (string.Equals(videoCodec, "libsvtav1", StringComparison.OrdinalIgnoreCase))
             {
@@ -2428,15 +2497,19 @@ namespace MediaBrowser.Controller.MediaEncoding
             // (never requests the init segment) -- playback fails even though the client
             // direct-plays the same file (whose own hvcC carries the real values, no
             // manifest to contradict). Force Main tier + the resolution-based level the
-            // manifest advertises (2160p -> L5.1, else L5.0). Our transcode bitrates fit
-            // Main tier L5.1 (~40 Mbps ceiling), so High tier is never needed and Main tier
-            // is the Apple-canonical choice. Forcing a level at/above NVENC's own pick is
-            // safe -- the "-level can fail NVENC" caveat is about levels too LOW for the
-            // content. Verified on dev: emits exactly hvc1.2.4.L153.B0.
-            if (IsHdrPassthroughMode(state)
-                && string.Equals(videoEncoder, "hevc_nvenc", StringComparison.OrdinalIgnoreCase))
+            // manifest advertises (2160p -> L5.1, else L5.0). Main tier is the Apple-canonical
+            // choice. Verified on dev: emits exactly hvc1.2.4.L153.B0.
+            //
+            // lidslabs 2026-08-04: two claims that used to live here were MEASURED FALSE and are
+            // corrected in LidslabsHevcHdrPinnedRateCeiling -- (1) "our transcode bitrates fit
+            // Main tier L5.1 (~40 Mbps ceiling)" ignored that the ceiling also binds bufsize,
+            // which Jellyfin sets to 2x bitrate; and (2) "forcing a level at/above NVENC's own
+            // pick is safe -- the caveat is about levels too LOW for the content" is wrong: a
+            // level can also be too low for the RATE CONTROL. The rate is clamped to the pinned
+            // level in GetVideoBitrateParam so the encode stays conformant with what we advertise.
+            if (LidslabsHevcHdrLevelPinApplies(state, videoEncoder))
             {
-                var hdrLevelToken = (state.OutputHeight >= 2160 || state.OutputWidth >= 3840) ? "5.1" : "5";
+                var hdrLevelToken = LidslabsHevcHdrPinnedIs2160p(state) ? "5.1" : "5";
                 param += " -tier:v main -level:v " + hdrLevelToken;
             }
 
