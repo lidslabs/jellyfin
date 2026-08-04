@@ -68,38 +68,56 @@ namespace MediaBrowser.Controller.MediaEncoding
         /// Default audio delivery ladder (lidslabs v0.4.0).
         /// </summary>
         /// <remarks>
-        /// Note the absence of a rate on <c>aac</c>. The useful target is a per-channel rate —
-        /// 144 kbps/channel, which is where libfdk_aac stops improving on loud wideband 7.1
-        /// content — and that is already the default in both GetDefaultAudioBitrate and
-        /// GetAudioBitrateParam, so it is derived from the negotiated channel count (8ch ->
-        /// 1152k, 6ch -> 864k) and then clamped against the session's total bitrate budget.
-        /// Writing an absolute "@1152k" here would be correct for 7.1 and silently wrong for
-        /// every other layout, so a rate is accepted as an operator override but is not the
-        /// normal way to use this lever.
         /// <para>
-        /// The ladder stops at <c>sidecar</c> deliberately: every rung that could sit below it
-        /// measured worse than simply letting Jellyfin negotiate unaided.
+        /// THERE IS NO <c>aac</c> RUNG, AND THAT IS NOT AN OMISSION (Nick, 2026-08-04). Listing it
+        /// would be dead configuration twice over. Below <c>sidecar</c> it is unreachable —
+        /// LidslabsResolveAudioRung returns null the moment it reads <c>sidecar</c>, by design, so
+        /// a codec the operator placed under the sidecar cannot pre-empt it. And above the sidecar
+        /// it would only pre-empt the bitstream track we now prefer. When nothing here resolves,
+        /// the caller leaves Jellyfin's stock choice untouched — and Jellyfin's stock choice for a
+        /// transcode IS aac, at the 144 kbps/channel target this series already lifted the ceiling
+        /// to. So AAC still catches everything that falls through; it just is not a lever, because
+        /// expressing a preference we do not actually hold is how a lever ends up meaning nothing.
         /// </para>
         /// <para>
-        /// <c>opus</c> sits ABOVE <c>aac</c> (Nick, 2026-08-04). It is the ONLY transcode target
-        /// in this build that carries a correctly-signalled 7.1 — see the channel-lookup comment
-        /// for the measurements — and channel count dominates bitrate: 5.1 is pinned 11-16 dB
-        /// from a 7.1 source at ANY bitrate, because the fold itself is the loss. That gap is
-        /// larger than any codec-quality difference between opus and aac, which our metrics
-        /// cannot rank anyway (D49).
+        /// <c>opus</c> sits first among the transcode rungs. It is the ONLY transcode target in
+        /// this build that carries a correctly-signalled 7.1 — see the channel-lookup comment for
+        /// the measurements — and channel count dominates bitrate: 5.1 is pinned 11-16 dB from a
+        /// 7.1 source at ANY bitrate, because the fold itself is the loss. That gap is larger than
+        /// any codec-quality difference between opus and aac, which our metrics cannot rank anyway
+        /// (D49). It costs nothing: the rung resolves only where a client positively advertises
+        /// opus, and opus has no MPEG-TS mapping at all, so every <c>.ts</c> client falls straight
+        /// through. Measured over the full request log 2026-08-03: Neptune's PROGRESSIVE profile
+        /// advertises <c>aac,ac3,eac3,flac,opus</c> (39 requests) and gains 7.1 here; its HLS-fMP4
+        /// profile (30 requests) and Wholphin's HLS-ts profile (11 requests) list no opus.
         /// </para>
         /// <para>
-        /// Ranking it first costs nothing. The rung resolves only where a client positively
-        /// advertises opus, and opus has no MPEG-TS mapping at all, so every <c>.ts</c> client
-        /// falls straight through to aac exactly as before. Measured over the full request log
-        /// 2026-08-03: Neptune's PROGRESSIVE profile advertises
-        /// <c>aac,ac3,eac3,flac,opus</c> (39 requests) and gains 7.1 here; its HLS-fMP4 profile
-        /// (<c>aac,eac3,ac3</c>, 30 requests) and Wholphin's HLS-ts profile
-        /// (<c>aac,ac3,eac3,mp3</c>, 11 requests) list no opus and are unaffected. Zero
-        /// regression, one upgrade.
+        /// <c>sidecar</c> now outranks any transcode. The reason is not codec quality — on our own
+        /// measurements AC-3 640k scores ~26.8 dB against libfdk 5.1 @864k at ~41.6 dB — it is that
+        /// the sidecar is a stream COPY that BITSTREAMS over HDMI to a receiver, which AAC
+        /// categorically cannot. A correctly-rendered 640k bitstream can beat a badly-rendered
+        /// 864k PCM fold, and on Wholphin that is exactly what was reported by ear. ⚠ THIS IS THE
+        /// ONE RUNG STILL AWAITING A LISTENING TEST; if the A/B goes the other way, move
+        /// <c>sidecar</c> back below a transcode rung via LIDSLABS_AUDIO_PREFERRED_CODEC.
+        /// </para>
+        /// <para>
+        /// What the sidecar actually resolves to here, measured across the library 2026-08-04
+        /// (452 lossless-default titles that have an ac3/eac3 track of >=6 channels; a further
+        /// 169 have none at all and fall through to stock aac):
+        /// <code>
+        ///   ac3   640k 6ch  310      eac3 1024k 8ch   17     [true 7.1, bitstreamed]
+        ///   ac3   448k 6ch  102      eac3  896k 8ch    5     [true 7.1, bitstreamed]
+        ///   ac3   384k 6ch    3      eac3  960k 6ch    5
+        ///                            eac3  768k 6ch   10
+        /// </code>
+        /// Note there is no such thing as 768k AC-3 — the format caps at 640k, and every track
+        /// above that here is E-AC-3. The 22 eight-channel E-AC-3 sidecars are the best audio this
+        /// server can deliver to a transcoding client, better than anything we can encode. The
+        /// 102 titles whose only sidecar is 448k are the weak spot in this ordering and the first
+        /// thing to revisit if the listening test is mixed.
         /// </para>
         /// </remarks>
-        private const string LidslabsDefaultAudioLadder = "copy,opus,aac,sidecar";
+        private const string LidslabsDefaultAudioLadder = "copy,opus,sidecar";
 
         /// <summary>
         /// Jellyfin's stock <c>TonemappingPeak</c>, read as "no operator opinion".
