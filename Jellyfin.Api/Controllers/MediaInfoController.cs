@@ -45,7 +45,7 @@ public class MediaInfoController : BaseJellyfinApiController
     /// once DV-in-AV1 has renderers worth targeting; the range term in LidslabsCodecPreservesRange
     /// already makes that a pure config change.
     /// </remarks>
-    private const string LidslabsDefaultVideoCodecs = "hevc,h264";
+    private const string LidslabsDefaultVideoCodecs = LidslabsEnv.PreferredVideoCodecDefault;
 
     private readonly IMediaSourceManager _mediaSourceManager;
     private readonly IDeviceManager _deviceManager;
@@ -430,15 +430,7 @@ public class MediaInfoController : BaseJellyfinApiController
             // and a profile that declares NOTHING is not the same as one that declares
             // no DV support — an absent condition means "unconstrained", i.e. the client
             // never narrowed the range at all. Both cases are logged distinctly.
-            var lidslabsDeclaredRanges = profile.CodecProfiles
-                .SelectMany(cp => cp.Conditions.Concat(cp.ApplyConditions))
-                .Where(c => c.Property == ProfileConditionValue.VideoRangeType)
-                .Select(c => c.Value)
-                .Where(v => !string.IsNullOrWhiteSpace(v))
-                .SelectMany(v => v.Split('|', StringSplitOptions.RemoveEmptyEntries | StringSplitOptions.TrimEntries))
-                .Distinct(StringComparer.OrdinalIgnoreCase)
-                .OrderBy(v => v, StringComparer.OrdinalIgnoreCase)
-                .ToArray();
+            var lidslabsDeclaredRanges = LidslabsClientCaps.DeclaredVideoRanges(profile);
 
             _logger.LogInformation(
                 "lidslabs.clientCaps: profile={ProfileName}, client={Client}, sourceRange={SourceRange}, "
@@ -809,48 +801,12 @@ public class MediaInfoController : BaseJellyfinApiController
         // easy to forget, and forgetting it fails SILENTLY: the stream still plays, it
         // is just no longer HDR.
         //
-        //   Dolby Vision  -> HEVC only. The RPU rides in HEVC NAL type 62; DV-in-AV1 is
-        //                    specified but essentially nothing renders it, so AV1 would
-        //                    discard the RPU. h264 cannot carry HDR at all.
-        //   HDR10/HLG     -> exclude h264. It has no HDR10 static-metadata carriage, so
-        //                    an h264 rung means a tonemapped SDR picture with no error
-        //                    logged anywhere (the Swiftfin washout, DEBUG_LOG 2026-07-21).
-        //   SDR/unknown   -> unrestricted. Unknown is deliberately permissive: refusing
-        //                    to rank on a range we could not compute would disable the
-        //                    lever on any item with odd probe output.
+        // The rule itself lives in LidslabsClientCaps because the remote bitrate-cap
+        // enforcement in StreamingHelpers has to make the identical judgement on the
+        // streaming path. Two hand-maintained copies of a rule whose failure mode is
+        // silent is the defect LidslabsEnv was written to end; do not re-inline it here.
         static Func<string, bool> LidslabsCodecPreservesRange(VideoRangeType rangeType)
-        {
-            var isDovi =
-                rangeType == VideoRangeType.DOVI
-                || rangeType == VideoRangeType.DOVIWithHDR10
-                || rangeType == VideoRangeType.DOVIWithEL
-                || rangeType == VideoRangeType.DOVIWithHDR10Plus
-                || rangeType == VideoRangeType.DOVIWithELHDR10Plus
-                || rangeType == VideoRangeType.DOVIWithHLG
-                || rangeType == VideoRangeType.DOVIWithSDR
-                || rangeType == VideoRangeType.DOVIInvalid;
-
-            if (isDovi)
-            {
-                return codec =>
-                    string.Equals(codec, "hevc", StringComparison.OrdinalIgnoreCase)
-                    || string.Equals(codec, "h265", StringComparison.OrdinalIgnoreCase);
-            }
-
-            var isHdr =
-                rangeType == VideoRangeType.HDR10
-                || rangeType == VideoRangeType.HDR10Plus
-                || rangeType == VideoRangeType.HLG;
-
-            if (isHdr)
-            {
-                return codec =>
-                    !string.Equals(codec, "h264", StringComparison.OrdinalIgnoreCase)
-                    && !string.Equals(codec, "avc", StringComparison.OrdinalIgnoreCase);
-            }
-
-            return _ => true;
-        }
+            => LidslabsClientCaps.CodecPreservesRange(rangeType);
 
         // Maps user-facing client names (e.g. "neptune", "streamyfin") to the
         // internal profile.Name substring(s) that identify each Jellyfin client

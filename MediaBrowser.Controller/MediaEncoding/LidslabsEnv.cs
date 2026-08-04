@@ -58,6 +58,18 @@ public static class LidslabsEnv
     /// <summary>Ranked video codec preference, e.g. "hevc,h264".</summary>
     public const string PreferredVideoCodec = "LIDSLABS_TRANSCODE_PREFERRED_VIDEO_CODEC";
 
+    /// <summary>
+    /// Default for <see cref="PreferredVideoCodec"/>. AV1 is deliberately absent: its advantage
+    /// is compression efficiency, which converts to visible quality only where bitrate is scarce.
+    /// </summary>
+    /// <remarks>
+    /// Lives here rather than at a call site because there are now two — the PlaybackInfo
+    /// negotiation and the forced transcode the remote bitrate cap produces — and an operator
+    /// ranking that means one thing on one path and something else on the other is worse than
+    /// no ranking at all.
+    /// </remarks>
+    public const string PreferredVideoCodecDefault = "hevc,h264";
+
     /// <summary>Ranked audio ladder, e.g. "copy,aac@1152k,sidecar".</summary>
     public const string PreferredAudioCodec = "LIDSLABS_AUDIO_PREFERRED_CODEC";
 

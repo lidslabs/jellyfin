@@ -439,7 +439,22 @@ public class VideosController : BaseJellyfinApiController
                 cancellationTokenSource.Token)
             .ConfigureAwait(false);
 
-        if (@static.HasValue && @static.Value && state.DirectStreamProvider is not null)
+        // lidslabs: every static branch below used to read the `static` query parameter
+        // directly, so clearing StreamingRequestDto.Static in GetStreamingState was not on its
+        // own enough to make the remote bitrate cap bind — the server would decide "transcode"
+        // and then serve the original file anyway. This is the second half of that fix.
+        //
+        // AND rather than replacing the query parameter with the state, because these are two
+        // different questions: `@static` is what the client asked for, `streamingRequest.Static`
+        // is what the server still agrees to after GetStreamingState has had its say. Direct
+        // play now needs both. AudioHelper has always read the request field, so this also puts
+        // the two transport paths back in step; the one behavioural delta is a client that sends
+        // `static=true` in the query and `false` in the legacy `params=` blob (ParseParams field
+        // 3), which now transcodes — it is a contradiction the client authored, and the audio
+        // path already resolves it this way.
+        var isStaticStream = (@static ?? false) && streamingRequest.Static;
+
+        if (isStaticStream && state.DirectStreamProvider is not null)
         {
             var liveStreamInfo = _mediaSourceManager.GetLiveStreamInfo(streamingRequest.LiveStreamId);
             if (liveStreamInfo is null)
@@ -453,19 +468,19 @@ public class VideosController : BaseJellyfinApiController
         }
 
         // Static remote stream
-        if (@static.HasValue && @static.Value && state.InputProtocol == MediaProtocol.Http)
+        if (isStaticStream && state.InputProtocol == MediaProtocol.Http)
         {
             var httpClient = _httpClientFactory.CreateClient(NamedClient.Default);
             return await FileStreamResponseHelpers.GetStaticRemoteStreamResult(state, httpClient, HttpContext).ConfigureAwait(false);
         }
 
-        if (@static.HasValue && @static.Value && state.InputProtocol != MediaProtocol.File)
+        if (isStaticStream && state.InputProtocol != MediaProtocol.File)
         {
             return BadRequest($"Input protocol {state.InputProtocol} cannot be streamed statically");
         }
 
         // Static stream
-        if (@static.HasValue && @static.Value && !(state.MediaSource.VideoType == VideoType.BluRay || state.MediaSource.VideoType == VideoType.Dvd))
+        if (isStaticStream && !(state.MediaSource.VideoType == VideoType.BluRay || state.MediaSource.VideoType == VideoType.Dvd))
         {
             var contentType = state.GetMimeType("." + state.OutputContainer, false) ?? state.GetMimeType(state.MediaPath);
 
