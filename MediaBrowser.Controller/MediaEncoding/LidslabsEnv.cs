@@ -61,8 +61,10 @@ public static class LidslabsEnv
     /// <summary>Ranked audio ladder, e.g. "copy,aac@1152k,sidecar".</summary>
     public const string PreferredAudioCodec = "LIDSLABS_AUDIO_PREFERRED_CODEC";
 
-    /// <summary>Enables substituting an in-file compatibility audio track.</summary>
-    public const string AllowAudioCompat = "LIDSLABS_AUDIO_ALLOW_COMPAT";
+    // LIDSLABS_AUDIO_ALLOW_COMPAT was declared here and read by nothing. Removed for the same
+    // reason as the NVEncC and DV-client levers: the compatibility-track substitution it named is
+    // unconditional, so an operator could set it, see it accepted, and change nothing. The opt-out
+    // it anticipated ships with the code that honours it or not at all.
 
     /// <summary>Maps each renamed lever to the pre-v0.4.0 name still honoured as an alias.</summary>
     private static readonly Dictionary<string, string> _legacyAliases = new(StringComparer.Ordinal)
@@ -73,6 +75,8 @@ public static class LidslabsEnv
     };
 
     private static readonly SortedDictionary<string, string> _legacyUsages = new(StringComparer.Ordinal);
+
+    private static readonly SortedDictionary<string, string> _conflicts = new(StringComparer.Ordinal);
 
     private static readonly object _legacyLock = new();
 
@@ -88,18 +92,40 @@ public static class LidslabsEnv
         // treating that as a deliberate silencing of the legacy value would
         // disable the lever in exactly the case this alias exists to protect.
         var value = Environment.GetEnvironmentVariable(name);
-        if (!string.IsNullOrEmpty(value))
+        var hasNew = !string.IsNullOrEmpty(value);
+
+        if (!_legacyAliases.TryGetValue(name, out var legacy))
+        {
+            return hasNew ? value : null;
+        }
+
+        var legacyValue = Environment.GetEnvironmentVariable(legacy);
+        var hasLegacy = !string.IsNullOrEmpty(legacyValue);
+
+        // BOTH NAMES SET TO DIFFERENT VALUES IS A MISCONFIGURATION THAT MUST NOT BE SILENT.
+        //
+        // The realistic way to arrive here is not operator confusion, it is layering: an image sets
+        // a default under the new name while the operator's compose still sets the old one. The new
+        // name then wins on every lookup, and the operator's setting -- the one they wrote, can see,
+        // and believe is in force -- is shadowed with nothing to indicate it. For the master HDR
+        // toggle that silently disables the entire feature the deployment exists for.
+        //
+        // The precedence itself is correct and stays. What was missing was any way to notice, so the
+        // conflict is recorded and reported alongside the deprecation notice at startup.
+        if (hasNew && hasLegacy && !string.Equals(value, legacyValue, StringComparison.Ordinal))
+        {
+            lock (_legacyLock)
+            {
+                _conflicts[legacy] = name;
+            }
+        }
+
+        if (hasNew)
         {
             return value;
         }
 
-        if (!_legacyAliases.TryGetValue(name, out var legacy))
-        {
-            return null;
-        }
-
-        var legacyValue = Environment.GetEnvironmentVariable(legacy);
-        if (string.IsNullOrEmpty(legacyValue))
+        if (!hasLegacy)
         {
             return null;
         }
@@ -110,6 +136,25 @@ public static class LidslabsEnv
         }
 
         return legacyValue;
+    }
+
+    /// <summary>
+    /// Returns levers whose new and legacy names carry conflicting values, and clears the record.
+    /// </summary>
+    /// <returns>Legacy name mapped to the new name that is overriding it; empty when none conflict.</returns>
+    public static IReadOnlyDictionary<string, string> ConsumeConflicts()
+    {
+        lock (_legacyLock)
+        {
+            if (_conflicts.Count == 0)
+            {
+                return new Dictionary<string, string>(StringComparer.Ordinal);
+            }
+
+            var snapshot = new Dictionary<string, string>(_conflicts, StringComparer.Ordinal);
+            _conflicts.Clear();
+            return snapshot;
+        }
     }
 
     /// <summary>

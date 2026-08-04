@@ -82,6 +82,16 @@ namespace MediaBrowser.Controller.MediaEncoding
         /// </para>
         /// </remarks>
         private const string LidslabsDefaultAudioLadder = "copy,aac,sidecar";
+
+        /// <summary>
+        /// Jellyfin's stock <c>TonemappingPeak</c>, read as "no operator opinion".
+        /// </summary>
+        /// <remarks>
+        /// Must track <c>EncodingOptions.TonemappingPeak</c>'s initialiser. If upstream changes its
+        /// default, this stops recognising an untouched configuration and every deployment silently
+        /// starts overriding the measured peak with a number nobody chose.
+        /// </remarks>
+        private const double LidslabsDefaultTonemappingPeak = 100d;
         private readonly IApplicationPaths _appPaths;
         private readonly IMediaEncoder _mediaEncoder;
         private readonly ISubtitleEncoder _subtitleEncoder;
@@ -3875,7 +3885,105 @@ namespace MediaBrowser.Controller.MediaEncoding
             return string.Empty;
         }
 
-        private string GetHwTonemapFilter(EncodingOptions options, string hwTonemapSuffix, string videoFormat, bool forceFullRange)
+        /// <summary>
+        /// Resolves the measured per-title tonemap peak, in the filter's nits ÷ 10 unit.
+        /// </summary>
+        /// <param name="state">The job, whose MediaSource identifies the title.</param>
+        /// <param name="options">Encoding options, consulted for an explicit operator override.</param>
+        /// <param name="peakTenNits">The resolved peak.</param>
+        /// <returns><c>true</c> when a usable measured peak exists for this title.</returns>
+        /// <remarks>
+        /// <para>
+        /// A FALSE RETURN MEANS "EMIT NOTHING", not "use options.TonemappingPeak". That is the whole
+        /// point, so it is worth stating why the obvious fallback is the wrong one.
+        /// </para>
+        /// <para>
+        /// <c>options.TonemappingPeak</c> is a single server-wide number applied to every title in
+        /// the library. Its stock value of 100 asserts a 1000-nit master; across 35 measured Dolby
+        /// Vision titles the true value ranged from ~220 to ~1170 nits, so the setting is wrong for
+        /// nearly everything and wrong in both directions. Substituting it for a title we could not
+        /// measure would replace "I don't know" with a confident wrong answer — and one the operator
+        /// cannot tell apart from a measured one.
+        /// </para>
+        /// <para>
+        /// Omitting the token instead hands the decision to the filter, which derives the peak from
+        /// the stream itself. Measured precedence, verified byte-identical against explicit values:
+        /// MaxCLL ÷ 10 when present and non-zero, else mastering-display max luminance ÷ 10, else a
+        /// transfer-function default (1000 for PQ, 100 for HLG). On a Dolby Vision stream with the
+        /// RPU intact the filter derives it from the RPU instead. All of that is per-title
+        /// information carried by the master, which beats a library-wide constant.
+        /// </para>
+        /// <para>
+        /// THAT LAST POINT IS THE SHARP EDGE. An explicit peak OVERRIDES the Dolby Vision derived
+        /// value, so stock Jellyfin's unconditional peak=100 is currently overriding Dolby Vision's
+        /// own peak on every DV title in the library. Emitting a measured peak still wins — scored
+        /// against real SDR masters of two DV titles it roughly halved the highlight error relative
+        /// to omitting — but a GUESSED peak would be strictly worse than saying nothing, because
+        /// saying nothing is what lets the RPU through.
+        /// </para>
+        /// </remarks>
+        private bool LidslabsTryGetTonemapPeak(EncodingJobInfo state, EncodingOptions options, out int peakTenNits)
+        {
+            peakTenNits = 0;
+
+            // THE DASHBOARD FIELD IS STILL A LIVE CONTROL, just no longer the default answer.
+            //
+            // Everything above argues that one library-wide peak is the wrong model, which is a
+            // reason to stop DEFAULTING to it -- not a reason to make an operator's explicit setting
+            // do nothing. A visible control that is silently ignored is the same defect as an env
+            // lever nothing reads, and this project has shipped that bug before.
+            //
+            // So Jellyfin's own default (100) is read as "no opinion, decide for me", and any other
+            // value is read as a deliberate override and wins outright. 100 is exactly the value
+            // being argued against, so nothing is lost by spending it as the sentinel, and both
+            // deployments already sit on it -- nobody's existing configuration changes meaning.
+            if (options is not null
+                && Math.Abs(options.TonemappingPeak - LidslabsDefaultTonemappingPeak) > 0.001)
+            {
+                peakTenNits = (int)Math.Round(options.TonemappingPeak, MidpointRounding.AwayFromZero);
+                return peakTenNits > LidslabsPeakStore.MinUsablePeakTenNits;
+            }
+
+            var source = state?.MediaSource;
+
+            if (source is not null
+                && LidslabsPeakStore.TryGetPeak(_appPaths, source.Path, source.Size, out peakTenNits))
+            {
+                return true;
+            }
+
+            // AN UNSCANNED NON-DV SOURCE KEEPS STOCK BEHAVIOUR RATHER THAN OMITTING, and that
+            // asymmetry with the DV path is measured, not incidental.
+            //
+            // Omitting beats the stock constant on a DV source because the filter then reads the
+            // RPU -- a real per-shot measurement. On an HDR10 source there is no RPU, so omitting
+            // falls through to MaxCLL, which is not a measurement of the same kind: it is a static
+            // LABEL and a MAXIMUM, max over every frame of the brightest pixel. That is precisely
+            // the statistic this work rejected, for precisely the same reason.
+            //
+            // Checked against the 34 titles with a measured p90, that label overstates it on 85% --
+            // median 1.59x, over 2x on 35%, over 4x on 9% -- and overstating is the expensive
+            // direction. Scored against real SDR masters with the RPU stripped so the titles behave
+            // as HDR10, auto-detection came out 12% WORSE than changing nothing on one title while
+            // better on the other. Two titles that disagree, with a known mechanism for the loss,
+            // is not a basis for changing the default.
+            //
+            // Most non-DV titles will not reach this branch: the scan measures every HDR title, DV
+            // or not, so the store lookup above normally answers first. This is the fallback for a
+            // title not yet scanned, and for it the safe answer is what stock Jellyfin already does.
+            var range = state?.VideoStream?.VideoRangeType;
+            if (range != VideoRangeType.DOVI)
+            {
+                peakTenNits = (int)Math.Round(
+                    options?.TonemappingPeak ?? LidslabsDefaultTonemappingPeak,
+                    MidpointRounding.AwayFromZero);
+                return peakTenNits > LidslabsPeakStore.MinUsablePeakTenNits;
+            }
+
+            return false;
+        }
+
+        private string GetHwTonemapFilter(EncodingJobInfo state, EncodingOptions options, string hwTonemapSuffix, string videoFormat, bool forceFullRange)
         {
             if (string.IsNullOrEmpty(hwTonemapSuffix))
             {
@@ -3887,6 +3995,7 @@ namespace MediaBrowser.Controller.MediaEncoding
             var mode = options.TonemappingMode.ToString().ToLowerInvariant();
             var range = forceFullRange ? TonemappingRange.pc : options.TonemappingRange;
             var rangeString = range.ToString().ToLowerInvariant();
+            var hasLidslabsPeak = LidslabsTryGetTonemapPeak(state, options, out var lidslabsPeak);
 
             if (string.Equals(hwTonemapSuffix, "vaapi", StringComparison.OrdinalIgnoreCase))
             {
@@ -3919,7 +4028,13 @@ namespace MediaBrowser.Controller.MediaEncoding
             }
             else
             {
-                args = "tonemap_{0}=format={1}:p=bt709:t=bt709:m=bt709:tonemap={2}:peak={3}:desat={4}";
+                // The peak term is CONDITIONAL, unlike stock Jellyfin which always emits it from the
+                // server-wide options.TonemappingPeak. See LidslabsTryGetTonemapPeak for why a
+                // missing measurement omits the token rather than falling back to that setting.
+                // Index {3} stays reserved either way so the remaining placeholders do not shift.
+                args = hasLidslabsPeak
+                    ? "tonemap_{0}=format={1}:p=bt709:t=bt709:m=bt709:tonemap={2}:peak={3}:desat={4}"
+                    : "tonemap_{0}=format={1}:p=bt709:t=bt709:m=bt709:tonemap={2}:desat={4}";
 
                 var useLegacyTonemapModes = _mediaEncoder.EncoderVersion >= _minFFmpegOclCuTonemapMode
                                            && _legacyTonemapModes.Contains(options.TonemappingMode);
@@ -3949,7 +4064,7 @@ namespace MediaBrowser.Controller.MediaEncoding
                     hwTonemapSuffix,
                     videoFormat ?? "nv12",
                     algorithm,
-                    options.TonemappingPeak,
+                    lidslabsPeak,
                     options.TonemappingDesat,
                     mode,
                     options.TonemappingParam,
@@ -4102,7 +4217,14 @@ namespace MediaBrowser.Controller.MediaEncoding
             {
                 // tonemapx requires yuv420p10 input for dovi reshaping, let ffmpeg convert the frame when necessary
                 var tonemapFormat = requireDoviReshaping ? "yuv420p" : outFormat;
-                var tonemapArgString = "tonemapx=tonemap={0}:desat={1}:peak={2}:t=bt709:m=bt709:p=bt709:format={3}";
+
+                // Same conditional peak as the hardware path; tonemapx takes the value in the same
+                // nits / 10 unit. Kept in step deliberately -- a title must not tonemap differently
+                // depending on whether the hardware filter happened to be available.
+                var hasSwPeak = LidslabsTryGetTonemapPeak(state, options, out var swPeak);
+                var tonemapArgString = hasSwPeak
+                    ? "tonemapx=tonemap={0}:desat={1}:peak={2}:t=bt709:m=bt709:p=bt709:format={3}"
+                    : "tonemapx=tonemap={0}:desat={1}:t=bt709:m=bt709:p=bt709:format={3}";
 
                 if (options.TonemappingParam != 0)
                 {
@@ -4120,7 +4242,7 @@ namespace MediaBrowser.Controller.MediaEncoding
                     tonemapArgString,
                     options.TonemappingAlgorithm,
                     options.TonemappingDesat,
-                    options.TonemappingPeak,
+                    swPeak,
                     tonemapFormat,
                     options.TonemappingParam,
                     options.TonemappingRange);
@@ -4289,7 +4411,7 @@ namespace MediaBrowser.Controller.MediaEncoding
             // hw tonemap
             if (doCuTonemap)
             {
-                var tonemapFilter = GetHwTonemapFilter(options, "cuda", "yuv420p", isMjpegEncoder);
+                var tonemapFilter = GetHwTonemapFilter(state, options, "cuda", "yuv420p", isMjpegEncoder);
                 mainFilters.Add(tonemapFilter);
             }
 
@@ -4522,7 +4644,7 @@ namespace MediaBrowser.Controller.MediaEncoding
             // hw tonemap
             if (doOclTonemap)
             {
-                var tonemapFilter = GetHwTonemapFilter(options, "opencl", "nv12", isMjpegEncoder);
+                var tonemapFilter = GetHwTonemapFilter(state, options, "opencl", "nv12", isMjpegEncoder);
                 mainFilters.Add(tonemapFilter);
             }
 
@@ -4862,7 +4984,7 @@ namespace MediaBrowser.Controller.MediaEncoding
             // hw tonemap
             if (doOclTonemap)
             {
-                var tonemapFilter = GetHwTonemapFilter(options, "opencl", "nv12", isMjpegEncoder);
+                var tonemapFilter = GetHwTonemapFilter(state, options, "opencl", "nv12", isMjpegEncoder);
                 mainFilters.Add(tonemapFilter);
             }
 
@@ -5099,7 +5221,7 @@ namespace MediaBrowser.Controller.MediaEncoding
                     mainFilters.Add("format=vaapi");
                 }
 
-                var tonemapFilter = GetHwTonemapFilter(options, "vaapi", "nv12", isMjpegEncoder);
+                var tonemapFilter = GetHwTonemapFilter(state, options, "vaapi", "nv12", isMjpegEncoder);
                 mainFilters.Add(tonemapFilter);
 
                 if (isQsvDecoder)
@@ -5119,7 +5241,7 @@ namespace MediaBrowser.Controller.MediaEncoding
             // ocl tonemap
             if (doOclTonemap)
             {
-                var tonemapFilter = GetHwTonemapFilter(options, "opencl", "nv12", isMjpegEncoder);
+                var tonemapFilter = GetHwTonemapFilter(state, options, "opencl", "nv12", isMjpegEncoder);
                 mainFilters.Add(tonemapFilter);
             }
 
@@ -5411,7 +5533,7 @@ namespace MediaBrowser.Controller.MediaEncoding
             // vaapi vpp tonemap
             if (doVaVppTonemap && isVaapiDecoder)
             {
-                var tonemapFilter = GetHwTonemapFilter(options, "vaapi", "nv12", isMjpegEncoder);
+                var tonemapFilter = GetHwTonemapFilter(state, options, "vaapi", "nv12", isMjpegEncoder);
                 mainFilters.Add(tonemapFilter);
             }
 
@@ -5424,7 +5546,7 @@ namespace MediaBrowser.Controller.MediaEncoding
             // ocl tonemap
             if (doOclTonemap)
             {
-                var tonemapFilter = GetHwTonemapFilter(options, "opencl", "nv12", isMjpegEncoder);
+                var tonemapFilter = GetHwTonemapFilter(state, options, "opencl", "nv12", isMjpegEncoder);
                 mainFilters.Add(tonemapFilter);
             }
 
@@ -5887,7 +6009,7 @@ namespace MediaBrowser.Controller.MediaEncoding
             // ocl tonemap
             if (doOclTonemap)
             {
-                var tonemapFilter = GetHwTonemapFilter(options, "opencl", "nv12", isMjpegEncoder);
+                var tonemapFilter = GetHwTonemapFilter(state, options, "opencl", "nv12", isMjpegEncoder);
                 mainFilters.Add(tonemapFilter);
             }
 
@@ -6095,7 +6217,7 @@ namespace MediaBrowser.Controller.MediaEncoding
             // Metal tonemap
             if (doMetalTonemap)
             {
-                var tonemapFilter = GetHwTonemapFilter(options, "videotoolbox", "nv12", isMjpegEncoder);
+                var tonemapFilter = GetHwTonemapFilter(state, options, "videotoolbox", "nv12", isMjpegEncoder);
                 mainFilters.Add(tonemapFilter);
             }
 
@@ -6347,7 +6469,7 @@ namespace MediaBrowser.Controller.MediaEncoding
             // ocl tonemap
             if (doOclTonemap)
             {
-                var tonemapFilter = GetHwTonemapFilter(options, "opencl", "nv12", isMjpegEncoder);
+                var tonemapFilter = GetHwTonemapFilter(state, options, "opencl", "nv12", isMjpegEncoder);
                 mainFilters.Add(tonemapFilter);
             }
 
