@@ -225,12 +225,16 @@ public static class LidslabsPeakStore
     /// </summary>
     /// <param name="appPaths">Application paths.</param>
     /// <param name="entries">Entries keyed by absolute media path.</param>
+    /// <param name="run">State of the scan pass doing the writing, or null when not scanning.</param>
     /// <remarks>
     /// Write-temp-then-move, because the reader is the transcode path: a partially written file
     /// would be read as a corrupt store and silently disable the fix across the whole library for
     /// as long as the scan takes.
     /// </remarks>
-    public static void Save(IApplicationPaths appPaths, IReadOnlyDictionary<string, LidslabsPeakEntry> entries)
+    public static void Save(
+        IApplicationPaths appPaths,
+        IReadOnlyDictionary<string, LidslabsPeakEntry> entries,
+        LidslabsPeakRun? run = null)
     {
         ArgumentNullException.ThrowIfNull(entries);
 
@@ -240,6 +244,7 @@ public static class LidslabsPeakStore
         var document = new LidslabsPeakDocument
         {
             Version = 1,
+            Run = run,
             Titles = new Dictionary<string, LidslabsPeakEntry>(entries, StringComparer.Ordinal),
         };
 

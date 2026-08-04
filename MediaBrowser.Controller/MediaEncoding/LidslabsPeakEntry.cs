@@ -39,9 +39,42 @@ public sealed class LidslabsPeakEntry
     public string? Method { get; set; }
 
     /// <summary>
-    /// Gets or sets the number of probe points sampled.
+    /// Gets or sets the number of probe points that produced a usable value.
     /// </summary>
+    /// <remarks>
+    /// The ACTUAL count, not the configured one. It previously recorded the constant, so every entry
+    /// in the store read <c>34</c> whether the title yielded 34 usable windows or the bare minimum of
+    /// 10 — which made the field useless for exactly the job it exists to do.
+    /// </remarks>
     public int Points { get; set; }
+
+    /// <summary>
+    /// Gets or sets how many DISTINCT values the probe points produced.
+    /// </summary>
+    /// <remarks>
+    /// The validity check on the measurement. A percentile over samples that are all the same number
+    /// is not a measurement of anything, and without this field it is indistinguishable from a real
+    /// one: Mickey 17 and The Wolf of Wall Street both stored <c>100 nits, method rpu, points 34</c>,
+    /// and both carry an L1 that never changes across the entire film — 17,365 frames, one value.
+    /// Their RPUs contain no per-shot grade at all, and the scan faithfully averaged a constant.
+    /// <para>
+    /// A count of 1 means placeholder metadata. Low counts are worth knowing about too but are NOT
+    /// the same defect: Dune: Part Two carries 5 distinct values and Bumblebee 191, and the first is
+    /// coarse where the second is a real curve.
+    /// </para>
+    /// </remarks>
+    public int Distinct { get; set; }
+
+    /// <summary>
+    /// Gets or sets why this entry was not measured by the method its source would normally imply.
+    /// </summary>
+    /// <remarks>
+    /// Currently only <c>rpu_flat</c>: a Dolby Vision title whose RPU carried no variation, so the
+    /// measurement was re-taken by decoding actual pixels. Null on the normal path. Recorded rather
+    /// than inferred because <see cref="Method"/> alone would then read <c>decode</c> on a DV title
+    /// and look like a tooling failure instead of a deliberate fallback.
+    /// </remarks>
+    public string? Fallback { get; set; }
 
     /// <summary>
     /// Gets or sets the size in bytes of the file when scanned, used to detect replacement.

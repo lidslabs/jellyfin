@@ -105,6 +105,14 @@ public class LidslabsPeakScanTask : IScheduledTask
     /// </remarks>
     private const int MinPoints = 10;
 
+    /// <summary>
+    /// At or below this many distinct probe values, the source metadata carries no grade.
+    /// </summary>
+    /// <remarks>
+    /// See the flat-L1 fallback in <c>MeasureAsync</c> for the measurements behind the value.
+    /// </remarks>
+    private const int FlatMetadataDistinctValues = 2;
+
     private const int QueryPageLimit = 100;
 
     private static readonly BaseItemKind[] _itemKinds = [BaseItemKind.Movie, BaseItemKind.Episode];
@@ -277,6 +285,21 @@ public class LidslabsPeakScanTask : IScheduledTask
         var completed = 0;
         var dirty = false;
 
+        // Run state travels with every incremental save, not just the final one, so a pass that is
+        // killed part way still leaves an honest account of itself in the file.
+        var startedUtc = DateTime.UtcNow;
+        LidslabsPeakRun Snapshot(bool done) => new()
+        {
+            StartedUtc = startedUtc,
+            UpdatedUtc = DateTime.UtcNow,
+            Completed = done,
+            Eligible = total,
+            Measured = scanned,
+            Skipped = skipped,
+            Failed = failed,
+            Remaining = Math.Max(0, total - completed),
+        };
+
         foreach (var item in candidates)
         {
             cancellationToken.ThrowIfCancellationRequested();
@@ -301,26 +324,32 @@ public class LidslabsPeakScanTask : IScheduledTask
                         && Array.IndexOf(_dolbyVisionRanges, stream.VideoRangeType) >= 0
                         && rpuToolsPresent;
 
-                    var nits = await MeasureAsync(path, runtimeSeconds, stream, useRpu, cancellationToken)
+                    var measurement = await MeasureAsync(path, runtimeSeconds, stream, useRpu, cancellationToken)
                         .ConfigureAwait(false);
-                    if (nits > 0)
+                    if (measurement.Nits > 0)
                     {
                         store[path] = new LidslabsPeakEntry
                         {
-                            Nits = nits,
-                            Method = useRpu ? "rpu" : "decode",
-                            Points = ProbePoints,
+                            Nits = measurement.Nits,
+                            Method = measurement.Method,
+                            Points = measurement.Points,
+                            Distinct = measurement.Distinct,
+                            Fallback = measurement.Fallback,
                             Size = size,
                             ScannedUtc = DateTime.UtcNow,
                         };
                         scanned++;
                         dirty = true;
                         _logger.LogInformation(
-                            "lidslabs.peakScan: {Name} = {Nits} nits (peak={Peak}, {Method})",
+                            "lidslabs.peakScan: {Name} = {Nits} nits (peak={Peak}, {Method}, "
+                            + "{Points} points, {Distinct} distinct{Fallback})",
                             item.Name,
-                            nits,
-                            nits / 10,
-                            useRpu ? "rpu" : "decode");
+                            measurement.Nits,
+                            measurement.Nits / 10,
+                            measurement.Method,
+                            measurement.Points,
+                            measurement.Distinct,
+                            measurement.Fallback is null ? string.Empty : ", fallback=" + measurement.Fallback);
                     }
                     else
                     {
@@ -333,7 +362,7 @@ public class LidslabsPeakScanTask : IScheduledTask
                     // make the task feel unreliable in exactly the situation it is most needed.
                     if (dirty && scanned % 10 == 0)
                     {
-                        SaveQuietly(store);
+                        SaveQuietly(store, Snapshot(done: false));
                         dirty = false;
                     }
                 }
@@ -343,10 +372,10 @@ public class LidslabsPeakScanTask : IScheduledTask
             progress.Report(100d * completed / total);
         }
 
-        if (dirty)
-        {
-            SaveQuietly(store);
-        }
+        // Always write on the way out, even with nothing dirty, so the run block records that this
+        // pass reached the end. An incremental save from mid-pass would otherwise be the last word
+        // and a completed scan would be indistinguishable from an abandoned one.
+        SaveQuietly(store, Snapshot(done: true));
 
         _logger.LogInformation(
             "lidslabs.peakScan: complete. {Scanned} measured, {Skipped} already current, {Failed} failed, {Total} considered.",
@@ -407,7 +436,101 @@ public class LidslabsPeakScanTask : IScheduledTask
         }
     }
 
-    private async Task<int> MeasureAsync(
+    /// <summary>
+    /// One title's measurement, with enough context to tell a real number from a fabricated one.
+    /// </summary>
+    /// <param name="Nits">The percentile peak, or 0 when no usable measurement was obtained.</param>
+    /// <param name="Points">Probe points that produced a usable value.</param>
+    /// <param name="Distinct">Distinct values among those points; 1 means the source is a constant.</param>
+    /// <param name="Method">The method that produced <paramref name="Nits"/>.</param>
+    /// <param name="Fallback">Why the method differs from the source's usual one, or null.</param>
+    private readonly record struct PeakMeasurement(
+        int Nits,
+        int Points,
+        int Distinct,
+        string Method,
+        string? Fallback);
+
+    private async Task<PeakMeasurement> MeasureAsync(
+        string path,
+        double runtimeSeconds,
+        MediaStream? stream,
+        bool useRpu,
+        CancellationToken cancellationToken)
+    {
+        var samples = await SampleAsync(path, runtimeSeconds, stream, useRpu, cancellationToken)
+            .ConfigureAwait(false);
+
+        var distinct = CountDistinct(samples);
+        string? fallback = null;
+
+        // A DOLBY VISION TITLE WHOSE L1 NEVER CHANGES HAS NO GRADE TO READ, and a percentile over a
+        // constant is not a measurement — it just launders the constant into something that looks
+        // measured. Swept across all 239 Dolby Vision titles in the reference library, 17 (7.1%)
+        // carry a completely flat L1, and the constant they carry is usually PLAUSIBLE: Spectre and
+        // 10 Cloverfield Lane both report 622 nits, Transformers: Age of Extinction 1555, Titanic
+        // 200. Only two of the seventeen were conspicuous. Nothing in the store distinguished them
+        // from a real measurement, which is why this check exists rather than an eyeball pass.
+        //
+        // TWO distinct values is the cut, not one. Verified against dense samples: Spectre holds one
+        // value across 17,372 frames, 1917 holds two across 17,382, and both are equally unusable —
+        // every percentile of 1917 lands on 630. A further 12 titles sit at exactly two. If an RPU
+        // says only two different things about an entire film it is not describing a per-shot grade,
+        // so decoding pixels is strictly more informative regardless of which side of the line the
+        // title falls on. Above two the counts run continuously up into the hundreds (Bumblebee has
+        // 191) with no natural gap, so a higher cut would start discarding real, if coarse, grades.
+        //
+        // Decode and RPU are NOT interchangeable in general — they disagree by -48% to +63% over 35
+        // titles, because one reads mastering intent and the other reads delivered light — so this
+        // is not a free substitution. Against metadata carrying no information it is still better.
+        if (useRpu && samples.Count > 0 && distinct <= FlatMetadataDistinctValues)
+        {
+            _logger.LogInformation(
+                "lidslabs.peakScan: RPU L1 carries no grade ({Points} points, {Distinct} distinct "
+                + "value(s)) for {Path} — re-measuring by decode.",
+                samples.Count,
+                distinct,
+                path);
+
+            var decoded = await SampleAsync(path, runtimeSeconds, stream, useRpu: false, cancellationToken)
+                .ConfigureAwait(false);
+
+            // Only take the fallback if it actually produced something usable. A decode that fails
+            // leaves the flat RPU result in place, which is still wrong but is at least recorded
+            // with Distinct = 1 so the store says so.
+            if (decoded.Count >= MinPoints)
+            {
+                samples = decoded;
+                distinct = CountDistinct(samples);
+                fallback = "rpu_flat";
+                useRpu = false;
+            }
+        }
+
+        var method = useRpu ? "rpu" : "decode";
+
+        if (samples.Count < MinPoints)
+        {
+            return new PeakMeasurement(0, samples.Count, distinct, method, fallback);
+        }
+
+        samples.Sort();
+        var nits = (int)Math.Round(PercentileOf(samples, Percentile), MidpointRounding.AwayFromZero);
+        return new PeakMeasurement(nits, samples.Count, distinct, method, fallback);
+    }
+
+    private static int CountDistinct(List<double> samples)
+    {
+        var seen = new HashSet<double>();
+        foreach (var s in samples)
+        {
+            seen.Add(s);
+        }
+
+        return seen.Count;
+    }
+
+    private async Task<List<double>> SampleAsync(
         string path,
         double runtimeSeconds,
         MediaStream? stream,
@@ -448,13 +571,7 @@ public class LidslabsPeakScanTask : IScheduledTask
             }
         }
 
-        if (samples.Count < MinPoints)
-        {
-            return 0;
-        }
-
-        samples.Sort();
-        return (int)Math.Round(PercentileOf(samples, Percentile), MidpointRounding.AwayFromZero);
+        return samples;
     }
 
     /// <summary>
@@ -576,11 +693,13 @@ public class LidslabsPeakScanTask : IScheduledTask
         }
     }
 
-    private void SaveQuietly(IReadOnlyDictionary<string, LidslabsPeakEntry> store)
+    private void SaveQuietly(
+        IReadOnlyDictionary<string, LidslabsPeakEntry> store,
+        LidslabsPeakRun? run = null)
     {
         try
         {
-            LidslabsPeakStore.Save(_appPaths, store);
+            LidslabsPeakStore.Save(_appPaths, store, run);
         }
         catch (IOException ex)
         {
