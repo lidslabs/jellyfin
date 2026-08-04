@@ -628,10 +628,20 @@ public class MediaInfoController : BaseJellyfinApiController
             // lidslabs v0.4.0: renamed to LIDSLABS_TRANSCODE_SDR_LADDER_CLIENTS, legacy
             // name still honoured. Prod deliberately leaves this UNSET so it inherits the
             // code default below; dev pins it explicitly.
+            // lidslabs v0.4.0: moonfin ADDED to the default set. Measured 2026-08-04 on dev
+            // and prod — Moonfin tvOS refuses an HDR-only master (fetches the playlists,
+            // requests zero segments, spawns no ffmpeg) and plays as soon as the companion
+            // rung is present. It is in the DEFAULT rather than left to the env var on
+            // purpose: this is a bug fix, and prod deliberately leaves the var UNSET so it
+            // inherits this list. Shipping it behind a lever would mean prod stayed broken
+            // until someone remembered to set it. The v0.3.3 exclusion note said Moonfin
+            // "spins up both rungs -> ~10s black at start"; that cost is real but it is
+            // strictly better than not playing at all, and it is the same trade every other
+            // client on this list already makes.
             var sdrLadderClients = LidslabsEnv.Raw(LidslabsEnv.SdrLadderClients);
             if (string.IsNullOrWhiteSpace(sdrLadderClients))
             {
-                sdrLadderClients = "swiftfin,neptune_av,jellyfin_ios";
+                sdrLadderClients = "swiftfin,neptune_av,jellyfin_ios,moonfin";
             }
 
             // lidslabs v0.3.4: match on the authenticated CLIENT NAME as well as
@@ -909,13 +919,35 @@ public class MediaInfoController : BaseJellyfinApiController
                     //     live capture (neptune/151, app 0.1.6) — DEBUG_LOG 2026-07-01.
                     "neptune_av" => profileName.Contains("Neptune tvOS", StringComparison.OrdinalIgnoreCase)
                                     && !profileName.Contains("Trident", StringComparison.OrdinalIgnoreCase),
-                    // lidslabs v0.3.3: the "moonfin" arm (patch 0014) was REMOVED. It was
-                    //     added only so Moonfin could take the force-SDR lever, which
-                    //     worked around an mpv HDR-render washout. That lever is gone
-                    //     (see the force-SDR removal note above), and Moonfin now renders
-                    //     HDR passthrough correctly on dev — no special-casing needed. If
-                    //     the washout ever returns, re-add the arm; the history is in
-                    //     DEBUG_LOG.md 2026-07-04 and .project/moonfin-hdr-mpv-washout-issue.md.
+                    // lidslabs v0.4.0: the "moonfin" arm is BACK, for the SDR COMPANION RUNG
+                    //     (not the washout it was originally added for, and not forced HEVC).
+                    //     History: added by patch 0014 (v0.3.2) to feed the force-SDR lever,
+                    //     removed by patch 0019 (v0.3.3) when that lever was deleted.
+                    //
+                    //     MEASURED 2026-08-04, from the wire. Moonfin tvOS black-screened on
+                    //     every transcode, on dev AND prod. Captured its PlaybackInfo POST and
+                    //     the master we serve it: a single variant,
+                    //       #EXT-X-STREAM-INF:...,VIDEO-RANGE=PQ,CODECS="hvc1.2.4.L153.B0,..."
+                    //     Moonfin fetches master.m3u8 + main.m3u8, posts
+                    //     Playing/Progress/Stopped, and requests ZERO segments — no ffmpeg is
+                    //     ever spawned. Identical with an Opus manifest and an AC-3 one, so
+                    //     audio was never the discriminator. That is the AVPlayer-family
+                    //     signature: a client refusing an HDR-ONLY master, which is exactly
+                    //     what patch 0020's SDR companion rung exists to prevent. Adding
+                    //     moonfin to the SDR-ladder set fixes it — verified on dev.
+                    //
+                    //     Its DeviceProfile also shows why nothing else fitted: HEVC carries
+                    //     NO VideoRangeType condition at all (the DOVI condition is on
+                    //     codec="av1"), and DirectPlayProfiles are wide open, which is why
+                    //     direct play always worked and only transcodes failed.
+                    //
+                    //     tvOS-SCOPED, mirroring neptune/neptune_ios: the tvOS profile is
+                    //     exactly "Moonfin", the iOS app posts "Moonfin iOS". Opt iOS in via
+                    //     the "moonfin_ios" arm if it ever needs the same rung.
+                    "moonfin" => profileName.Contains("Moonfin", StringComparison.OrdinalIgnoreCase)
+                                 && !profileName.Contains("iOS", StringComparison.OrdinalIgnoreCase),
+                    // lidslabs v0.4.0: Moonfin's iOS/iPadOS app. NOT in any default set.
+                    "moonfin_ios" => profileName.Contains("Moonfin iOS", StringComparison.OrdinalIgnoreCase),
                     _ => false,
                 };
 
