@@ -6529,15 +6529,11 @@ namespace MediaBrowser.Controller.MediaEncoding
                 return false;
             }
 
-            // Environment-variable gate. Set LIDSLABS_ALLOW_HDR_TRANSCODE=1 to enable.
-            var envFlag = Environment.GetEnvironmentVariable("LIDSLABS_ALLOW_HDR_TRANSCODE");
-            if (string.IsNullOrEmpty(envFlag))
-            {
-                return false;
-            }
-
-            return string.Equals(envFlag, "1", StringComparison.Ordinal)
-                || string.Equals(envFlag, "true", StringComparison.OrdinalIgnoreCase);
+            // Environment-variable gate. Set LIDSLABS_TRANSCODE_ALLOW_HDR=1 to enable
+            // (legacy LIDSLABS_ALLOW_HDR_TRANSCODE still honoured — see LidslabsEnv).
+            // This parse used to be duplicated in MediaInfoController and the two
+            // copies had to be kept in agreement by hand; there is now one.
+            return LidslabsEnv.Flag(LidslabsEnv.AllowHdr);
         }
 
         public static int GetVideoColorBitDepth(EncodingJobInfo state)

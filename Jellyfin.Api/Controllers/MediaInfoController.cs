@@ -14,6 +14,7 @@ using MediaBrowser.Common.Extensions;
 using MediaBrowser.Controller.Devices;
 using MediaBrowser.Controller.Entities;
 using MediaBrowser.Controller.Library;
+using MediaBrowser.Controller.MediaEncoding;
 using MediaBrowser.Model.Dlna;
 using MediaBrowser.Model.Entities;
 using MediaBrowser.Model.MediaInfo;
@@ -213,7 +214,10 @@ public class MediaInfoController : BaseJellyfinApiController
         // it is deliberately NOT in any default, because whether forcing HEVC is right
         // depends on the DEVICE's display, not the app (an iPad 8 has no HDR display at
         // all — see the neptune arm note in LidslabsClientMatches).
-        var lidslabsForceHevcClients = Environment.GetEnvironmentVariable("LIDSLABS_FORCE_HEVC_CLIENTS");
+        // lidslabs v0.4.0: renamed to LIDSLABS_TRANSCODE_FORCE_HEVC_CLIENTS; the old
+        // name is still honoured as an alias so a running deployment does not lose the
+        // lever on the next pull. See LidslabsEnv.
+        var lidslabsForceHevcClients = LidslabsEnv.Raw(LidslabsEnv.ForceHevcClients);
 
         var lidslabsForceHevcEligible =
             profile is not null
@@ -252,6 +256,22 @@ public class MediaInfoController : BaseJellyfinApiController
             "lidslabs.swiftfin gate: client={Client}, eligible={Eligible}",
             User.GetClient(),
             lidslabsSwiftfinClient);
+
+        // lidslabs v0.4.0: report any lever still being read under its pre-v0.4.0 name.
+        // Warning, not Debug, and deliberately so — the whole reason the legacy aliases
+        // exist is that a silent rename disables levers on the next pull, and this
+        // project has now shipped a silently-dead lever twice (the tvOS client rename,
+        // patch 0017; the v0.3.4 SDR-ladder allowlist). An alias that works but is never
+        // announced just moves the silence one release later. ConsumeLegacyUsages clears
+        // its record, so this is one line per legacy name per boot, not per playback.
+        var lidslabsLegacyLevers = LidslabsEnv.ConsumeLegacyUsages();
+        foreach (var (legacyName, currentName) in lidslabsLegacyLevers)
+        {
+            _logger.LogWarning(
+                "lidslabs: env var {LegacyName} is deprecated and will be removed in a future release; rename it to {CurrentName}",
+                legacyName,
+                currentName);
+        }
 
         // Copy params from posted body
         // TODO clean up when breaking API compatibility.
@@ -445,7 +465,10 @@ public class MediaInfoController : BaseJellyfinApiController
             // passthrough path, surfacing on its Native player as AVFoundation -11850
             // (AVErrorServerIncorrectlyConfigured — "no variant in this master is playable
             // for me"). DEBUG_LOG 2026-07-30.
-            var sdrLadderClients = Environment.GetEnvironmentVariable("LIDSLABS_SDR_LADDER_CLIENTS");
+            // lidslabs v0.4.0: renamed to LIDSLABS_TRANSCODE_SDR_LADDER_CLIENTS, legacy
+            // name still honoured. Prod deliberately leaves this UNSET so it inherits the
+            // code default below; dev pins it explicitly.
+            var sdrLadderClients = LidslabsEnv.Raw(LidslabsEnv.SdrLadderClients);
             if (string.IsNullOrWhiteSpace(sdrLadderClients))
             {
                 sdrLadderClients = "swiftfin,neptune_av,jellyfin_ios";
@@ -758,22 +781,17 @@ public class MediaInfoController : BaseJellyfinApiController
                 || p.TranscodingProfiles.Any(tp => LidslabsSplitTrim(tp.VideoCodec).Contains("hevc", StringComparer.OrdinalIgnoreCase))
                 || p.CodecProfiles.Any(cp => LidslabsSplitTrim(cp.Codec).Contains("hevc", StringComparer.OrdinalIgnoreCase));
 
-        // lidslabs v0.3.2 (patch 0013): mirror the LIDSLABS_ALLOW_HDR_TRANSCODE gate
-        // parse from EncodingHelper.IsHdrPassthroughMode so PlaybackInfo can tell whether
-        // an eligible HDR/DV source will be delivered as HDR (passthrough) rather than
-        // tonemapped to SDR. Same accepted values ("1" / "true") the transcode path uses,
-        // so the delivered-range rewrite above never disagrees with what ffmpeg emits.
+        // lidslabs v0.3.2 (patch 0013): PlaybackInfo needs to know whether an eligible
+        // HDR/DV source will be delivered as HDR (passthrough) rather than tonemapped to
+        // SDR, so the delivered-range rewrite above never disagrees with what ffmpeg emits.
+        //
+        // lidslabs v0.4.0: this used to be a hand-maintained MIRROR of the parse in
+        // EncodingHelper.IsHdrPassthroughMode — two copies of the same literals that had to
+        // be kept in agreement by convention. Both now call the one parse, so they cannot
+        // drift. Retained as a named local function purely so the call sites below still
+        // read as intent rather than as an env lookup.
         static bool LidslabsHdrTranscodeEnabled()
-        {
-            var envFlag = Environment.GetEnvironmentVariable("LIDSLABS_ALLOW_HDR_TRANSCODE");
-            if (string.IsNullOrEmpty(envFlag))
-            {
-                return false;
-            }
-
-            return string.Equals(envFlag, "1", StringComparison.Ordinal)
-                || string.Equals(envFlag, "true", StringComparison.OrdinalIgnoreCase);
-        }
+            => LidslabsEnv.Flag(LidslabsEnv.AllowHdr);
 
         // Rewrites every video HLS TranscodingProfile's container to mp4 so the
         // resulting HLS stream is muxed as fMP4 (CMAF) instead of MPEG-TS. Apple
