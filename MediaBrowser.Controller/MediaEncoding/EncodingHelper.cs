@@ -80,8 +80,26 @@ namespace MediaBrowser.Controller.MediaEncoding
         /// The ladder stops at <c>sidecar</c> deliberately: every rung that could sit below it
         /// measured worse than simply letting Jellyfin negotiate unaided.
         /// </para>
+        /// <para>
+        /// <c>opus</c> sits ABOVE <c>aac</c> (Nick, 2026-08-04). It is the ONLY transcode target
+        /// in this build that carries a correctly-signalled 7.1 — see the channel-lookup comment
+        /// for the measurements — and channel count dominates bitrate: 5.1 is pinned 11-16 dB
+        /// from a 7.1 source at ANY bitrate, because the fold itself is the loss. That gap is
+        /// larger than any codec-quality difference between opus and aac, which our metrics
+        /// cannot rank anyway (D49).
+        /// </para>
+        /// <para>
+        /// Ranking it first costs nothing. The rung resolves only where a client positively
+        /// advertises opus, and opus has no MPEG-TS mapping at all, so every <c>.ts</c> client
+        /// falls straight through to aac exactly as before. Measured over the full request log
+        /// 2026-08-03: Neptune's PROGRESSIVE profile advertises
+        /// <c>aac,ac3,eac3,flac,opus</c> (39 requests) and gains 7.1 here; its HLS-fMP4 profile
+        /// (<c>aac,eac3,ac3</c>, 30 requests) and Wholphin's HLS-ts profile
+        /// (<c>aac,ac3,eac3,mp3</c>, 11 requests) list no opus and are unaffected. Zero
+        /// regression, one upgrade.
+        /// </para>
         /// </remarks>
-        private const string LidslabsDefaultAudioLadder = "copy,aac,sidecar";
+        private const string LidslabsDefaultAudioLadder = "copy,opus,aac,sidecar";
 
         /// <summary>
         /// Jellyfin's stock <c>TonemappingPeak</c>, read as "no operator opinion".
@@ -163,6 +181,74 @@ namespace MediaBrowser.Controller.MediaEncoding
 
         // Set max transcoding channels for encoders that can't handle more than a set amount of channels
         // AAC, FLAC, ALAC, libopus, libvorbis encoders all support at least 8 channels
+        //
+        // lidslabs: WE DELIBERATELY DO NOT TOUCH { "libfdk_aac", 6 } BELOW. It is stock
+        // Jellyfin and it is correct. An earlier draft of this series lifted it and restored it
+        // two patches later before that was understood; read this before removing it a third time.
+        //
+        // The stock comment above is true of the FORMAT and false of the ENCODER WE HAVE.
+        // libfdk_aac cannot express an 8-channel stream that our clients can decode. Measured
+        // in-container 2026-08-03 by parsing the AudioSpecificConfig out of the muxed output:
+        //
+        //   -ac 6                     -> ASC 11b0                      channelConfiguration=6
+        //   -ac 8 -channel_layout 7.1 -> ASC 118004c809000108c80000    channelConfiguration=0
+        //   -ac 8 (7.1(wide))         -> ASC 118004cc05000108c80000    channelConfiguration=0
+        //
+        // channelConfiguration=0 means "the layout is not one of the standard configurations,
+        // parse an inband Program Config Element instead". libfdk emits it for EVERY 8-channel
+        // layout, in EVERY container — the same config 0 appears in the ADTS header on mpegts
+        // and in the esds ASC on fMP4. A decoder that cannot parse a PCE cannot start the
+        // stream at all, because it never learns the channel count.
+        //
+        // Two clients, two failure sites, one cause — device round 2026-08-03:
+        //
+        //   Neptune tvOS AV (AVFoundation) -> fetched the fMP4 INIT SEGMENT 3 times and zero
+        //       media segments, both sessions. The init segment is where the ASC lives; it
+        //       read the codec configuration, could not use it, retried, gave up. Black screen.
+        //   Wholphin / SHIELD (ExoPlayer) -> got further, because mpegts has no init segment:
+        //       23 segments served clean, then
+        //       ACodec: [OMX.google.aac.decoder] ERROR(0x80001001) -> Decoder failed,
+        //       with ExoPlayer's own static check reporting format_supported=YES.
+        //
+        // Trident plays it because mpv/libav parses PCE. That is the whole difference.
+        //
+        // The 2026-08-02 round (patch 0040) reached this same conclusion from a stream that was
+        // ALSO mislabelled 7.1(wide), so its evidence really was confounded — but the confound
+        // did not change the answer, because both layouts produce channelConfiguration=0. Patch
+        // 0046 pinned the layout on that theory and the failure reproduced identically. The
+        // layout was never the variable.
+        //
+        // There is no correct 8-channel AAC option here, and the near misses are worse than the
+        // cap, so do not "fix" this by switching encoders:
+        //   ffmpeg native aac + 7.1 -> ASC 11b856e500, channelConfiguration=7. Self-describing
+        //       and it DOES decode — but config 7 is 7.1(WIDE), so a receiver routes the back
+        //       surrounds to the front centre pair. Silently wrong output beats a black screen
+        //       only until someone listens to it.
+        //   libfdk + 5.1.2          -> channelConfiguration=14, self-describing, but those are
+        //       height channels; wrong semantics for a 7.1 source.
+        //
+        // So 144 kbps/channel * 6 = 864k is the real ceiling for a transcoded AAC rung, and
+        // GetAudioBitrateParam already lands there.
+        //
+        // AND IT IS NOT AN AAC PROBLEM — nothing else we can encode carries 7.1 either.
+        // Measured 2026-08-03 against jellyfin-ffmpeg 8.1.2:
+        //
+        //   eac3 / ac3 / dca -> 5.1 MAX. E-AC-3 the FORMAT does 7.1 via dependent substreams;
+        //       ffmpeg decodes those and has never implemented encoding them, and it is the only
+        //       AC-3-family encoder in this build. Worse, `-ac 8` SILENTLY folds to 5.1 and
+        //       reports success — it errors only when the layout is named explicitly.
+        //   libopus          -> `opus, 8, 7.1`. Clean. OpusHead mapping family 1 is always
+        //       self-describing, so there is no PCE to refuse.
+        //   flac             -> 8ch clean too, but lossless: 85% bitrate variance vs AAC's 7%.
+        //
+        // Opus is therefore the ONLY correctly-signalled 7.1 transcode target we have, which is
+        // why the ladder ranks it ABOVE aac. That costs nothing: the rung resolves only where a
+        // client positively advertises opus, and opus has no MPEG-TS mapping at all, so every
+        // `.ts` client falls straight through to the 5.1 aac rung exactly as before.
+        //
+        // Before touching this again: prove DECODE on device, and read the ASC first. Encoder
+        // correlation is not playback (D51 made that mistake), a device result off a mislabelled
+        // stream is not evidence, and a relabel is not a fix when the label was never what broke.
         private static readonly Dictionary<string, int> _audioTranscodeChannelLookup = new(StringComparer.OrdinalIgnoreCase)
         {
             { "libmp3lame", 2 },
@@ -3024,7 +3110,7 @@ namespace MediaBrowser.Controller.MediaEncoding
         /// 20.0 kHz) and costs =0.4 dB SNR at 1152k. 20000 is fdk's documented ceiling; asking for
         /// 22050 is rejected outright ("cutoff valid range is 188-20000").
         /// </remarks>
-        internal static string GetLidslabsAudioEncoderQualityParams(string encoder)
+        public static string GetLidslabsAudioEncoderQualityParams(string encoder)
         {
             if (string.Equals(encoder, "libfdk_aac", StringComparison.OrdinalIgnoreCase))
             {

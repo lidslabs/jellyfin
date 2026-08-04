@@ -1750,6 +1750,12 @@ public class DynamicHlsController : BaseJellyfinApiController
 
             audioTranscodeParams += " -acodec " + audioCodec + bitStreamArgs + strictArgs;
 
+            // lidslabs v0.4.0: the libfdk 17 kHz lowpass fix reaches HLS too. It originally
+            // landed only on the two progressive builders in EncodingHelper, so every HLS
+            // client -- which is nearly all of them -- kept getting the defect the fix exists
+            // for. Same shape as the v0.3.4 iOS miss: one fix, two code paths, one patched.
+            audioTranscodeParams += EncodingHelper.GetLidslabsAudioEncoderQualityParams(audioCodec);
+
             var audioBitrate = state.OutputAudioBitrate;
             var audioChannels = state.OutputAudioChannels;
 
@@ -1793,6 +1799,10 @@ public class DynamicHlsController : BaseJellyfinApiController
         }
 
         var args = "-codec:a:0 " + audioCodec + bitStreamArgs + strictArgs;
+
+        // lidslabs v0.4.0: see the note on the audio-only builder above -- this is the video
+        // path's copy of the same missing -cutoff.
+        args += EncodingHelper.GetLidslabsAudioEncoderQualityParams(audioCodec);
 
         var channels = state.OutputAudioChannels;
 

@@ -61,6 +61,15 @@ public static class LidslabsEnv
     /// <summary>Ranked audio ladder, e.g. "copy,aac@1152k,sidecar".</summary>
     public const string PreferredAudioCodec = "LIDSLABS_AUDIO_PREFERRED_CODEC";
 
+    // No LIDSLABS_AUDIO_MAX_CHANNELS. A draft of the 8-channel AAC fix added one so the
+    // corrected build could be tested without shipping the change, and it was removed before
+    // release for two reasons (Nick, 2026-08-03). It named a general property and delivered a
+    // libfdk_aac-specific one, which is the shape of lever that reads as configured and is not;
+    // and the underlying change is a BUG FIX, not a preference — AAC does 8 channels, we were
+    // capping it to 6, and the negotiated ceiling already comes from the client's own
+    // TranscodingMaxAudioChannels. A fix does not ship behind a switch: if it turns out wrong on
+    // device it is reverted, not left as an env var nobody sets.
+
     // LIDSLABS_AUDIO_ALLOW_COMPAT was declared here and read by nothing. Removed for the same
     // reason as the NVEncC and DV-client levers: the compatibility-track substitution it named is
     // unconditional, so an operator could set it, see it accepted, and change nothing. The opt-out
