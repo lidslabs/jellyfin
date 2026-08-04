@@ -401,7 +401,7 @@ namespace MediaBrowser.Controller.MediaEncoding
         /// <remarks>
         /// Convenience wrapper around <see cref="EncodingHelper.IsHdrPassthroughMode(EncodingJobInfo)"/>
         /// so other components can query encoding state without taking a hard dependency
-        /// on EncodingHelper. Currently gated on the <c>LIDSLABS_ALLOW_HDR_TRANSCODE</c>
+        /// on EncodingHelper. Currently gated on the <c>LIDSLABS_TRANSCODE_ALLOW_HDR</c>
         /// environment variable.
         /// </remarks>
         public bool IsHdrTranscoding => EncodingHelper.IsHdrPassthroughMode(this);

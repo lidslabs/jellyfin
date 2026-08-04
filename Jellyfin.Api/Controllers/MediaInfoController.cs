@@ -287,6 +287,23 @@ public class MediaInfoController : BaseJellyfinApiController
                 currentName);
         }
 
+        // A lever set under BOTH names with different values is worse than a deprecated one: the
+        // new name wins, so the operator's visible setting is shadowed and does nothing. The way
+        // that happens in practice is layering -- an image default under the new name against a
+        // compose file still using the old one -- which is silent by construction because neither
+        // side is wrong on its own. Error rather than Warning: a deprecated name still works, but
+        // this one means the deployment is not doing what its configuration says.
+        var lidslabsConflicts = LidslabsEnv.ConsumeConflicts();
+        foreach (var (legacyName, currentName) in lidslabsConflicts)
+        {
+            _logger.LogError(
+                "lidslabs: env var {LegacyName} is set but IGNORED because {CurrentName} is also set "
+                + "with a different value. The value of {CurrentName} is in effect. Remove one.",
+                legacyName,
+                currentName,
+                currentName);
+        }
+
         // Copy params from posted body
         // TODO clean up when breaking API compatibility.
         userId ??= playbackInfoDto?.UserId;
