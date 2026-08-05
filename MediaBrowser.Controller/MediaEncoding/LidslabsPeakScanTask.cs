@@ -210,16 +210,24 @@ public class LidslabsPeakScanTask : IScheduledTask
     }
 
     /// <inheritdoc />
-    public string Name => "Scan Dolby Vision peak luminance";
+    /// <remarks>
+    /// Named for HDR, not Dolby Vision. It was "Scan Dolby Vision peak luminance" while the RPU was
+    /// the only source it read, but it covers every HDR title — of 828 eligible in the reference
+    /// library only 239 are DV, and the other 589 are measured by decode. The old name understated
+    /// its runtime by more than 3x to anyone reading the task list before starting it.
+    /// </remarks>
+    public string Name => "Scan HDR peak luminance";
 
     /// <inheritdoc />
     public string Key => "LidslabsPeakScan";
 
     /// <inheritdoc />
     public string Description =>
-        "Measures the peak luminance of each Dolby Vision title so HDR to SDR transcodes tonemap "
-        + "against the title's real peak instead of a single library-wide assumption. Titles already "
-        + "measured are skipped, so routine runs only cover newly added media.";
+        "Measures the peak luminance of each HDR title so HDR to SDR transcodes tonemap against the "
+        + "title's real peak instead of a single library-wide assumption. Dolby Vision titles are read "
+        + "from their RPU metadata where it carries a real per-shot grade, and decoded otherwise; "
+        + "HDR10 and HLG titles are always decoded, which is slower. Titles already measured are "
+        + "skipped, so routine runs only cover newly added media and a first full pass takes hours.";
 
     /// <inheritdoc />
     public string Category => "Library";

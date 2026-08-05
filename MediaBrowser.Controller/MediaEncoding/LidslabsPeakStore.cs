@@ -50,7 +50,7 @@ namespace MediaBrowser.Controller.MediaEncoding;
 public static class LidslabsPeakStore
 {
     /// <summary>
-    /// Peaks at or below this value are treated as ABSENT rather than emitted.
+    /// The lowest peak the filter can be told; measurements below it are clamped up to it.
     /// </summary>
     /// <remarks>
     /// <para>
@@ -61,10 +61,11 @@ public static class LidslabsPeakStore
     /// to stop asserting. Emitting a low peak is therefore worse than emitting nothing.
     /// </para>
     /// <para>
-    /// The threshold sits at 11 rather than 10 by choice, not by necessity — 10.5, 11 and 12 are all
-    /// honoured and produce distinct output. A title measuring under ~110 nits is either not HDR or
-    /// mis-measured, and in both cases the honest answer is "no data": omission lets the filter read
-    /// the stream's own metadata, which is better evidence than a suspect measurement.
+    /// The threshold sits at 11 rather than 10 because 11 is the first value the filter honours:
+    /// 10.5, 11 and 12 all produce distinct output, while everything at or below 10 collapses onto
+    /// the 1000-nit constant. It is therefore the closest a genuinely dim title can be represented,
+    /// and a measurement under it is clamped here rather than thrown away — see
+    /// <see cref="TryGetPeak"/> for why discarding was worse than clamping.
     /// </para>
     /// </remarks>
     public const int MinUsablePeakTenNits = 11;
@@ -132,13 +133,29 @@ public static class LidslabsPeakStore
             return false;
         }
 
+        // A MEASUREMENT BELOW WHAT THE FILTER CAN EXPRESS IS CLAMPED, NOT DISCARDED.
+        //
+        // This used to return false, on the reasoning that a title under ~110 nits is either not HDR
+        // or mis-measured, and that omission would then let the filter read the stream's own
+        // metadata. Both halves turned out to be wrong.
+        //
+        // Discarding does not produce omission. The caller's next branch catches any range that is
+        // not exactly VideoRangeType.DOVI -- which includes every profile 7 and profile 8 title --
+        // and emits the stock 1000-nit constant instead. The Wolf of Wall Street decodes to 94 nits
+        // over 34 windows with 22 distinct values, a perfectly credible measurement, and was being
+        // tonemapped as though it peaked at 1000: an order of magnitude out, in the direction that
+        // darkens the picture.
+        //
+        // And omission would not have helped anyway. Measured on a DV title, omitting peak produced
+        // the same YAVG and YMAX as peak=100, so "let the filter decide" resolves to the same
+        // constant this class exists to stop asserting.
+        //
+        // The floor is a limit of the FILTER, not of the measurement: peak <= 10 is silently
+        // replaced by 100 (byte-identical output, md5 011e4e41), while 11, 12, 15 and 20 are all
+        // honoured and render distinctly. So the closest truth we can express for a 94-nit title is
+        // the floor itself, not a number ten times too large.
         var value = entry.Nits / 10;
-        if (value <= MinUsablePeakTenNits)
-        {
-            return false;
-        }
-
-        peakTenNits = value;
+        peakTenNits = Math.Max(value, MinUsablePeakTenNits);
         return true;
     }
 

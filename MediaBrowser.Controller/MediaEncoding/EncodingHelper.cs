@@ -117,7 +117,26 @@ namespace MediaBrowser.Controller.MediaEncoding
         /// thing to revisit if the listening test is mixed.
         /// </para>
         /// </remarks>
-        private const string LidslabsDefaultAudioLadder = "copy,opus,sidecar";
+        /// <para>
+        /// OPUS WAS REMOVED FROM THE DEFAULT ON 2026-08-04, after listening tests, and deferred to
+        /// v0.5.0. It is still a valid rung anyone can set; it is just not what ships.
+        /// </para>
+        /// <para>
+        /// It sounded good — fuller and louder than the AC-3 sidecar on 7.1 Atmos content, on
+        /// Neptune Trident. Three things outweighed that. It is reachable by exactly ONE client:
+        /// Trident takes it, Wholphin cannot, and Moonfin DECLARES opus, is handed it, and fails
+        /// playback outright — the fifth client this release to advertise a capability it does not
+        /// have. It only ever applies to TRANSCODES, so the people who would receive it are remote
+        /// viewers on capped links, and 1152 kbps of audio comes out of the video budget for
+        /// exactly that audience. And the comparison was not level-matched, with the louder side
+        /// also carrying 7.1 against a 5.1 fold, so "better" was never isolated to the codec.
+        /// </para>
+        /// <para>
+        /// Shipping a default that serves one client and breaks another is a lever, not a default.
+        /// Revisit in v0.5.0 with a level-matched A/B and, if it wins, per-client scoping rather
+        /// than a global rung.
+        /// </para>
+        private const string LidslabsDefaultAudioLadder = "copy,sidecar";
 
         /// <summary>
         /// Jellyfin's stock <c>TonemappingPeak</c>, read as "no operator opinion".
